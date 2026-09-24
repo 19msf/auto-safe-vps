@@ -1,0 +1,118 @@
+---
+- name: 安装 ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: 默认拒绝入站
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: 默认允许出站
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: 允许当前生效的 SSH 端口
+  community.general.ufw:
+    rule: allow
+    port: "{{ effective_ssh_port }}"
+    proto: tcp
+    comment: "SSH (autosafe)"
+
+- name: 允许蜜罐端口（仅当与 SSH 端口不同时；同端口冲突由 site.yml 断言保护）
+  community.general.ufw:
+    rule: allow
+    port: "{{ honeypot.port | default(22) }}"
+    proto: tcp
+    comment: "honeypot"
+  when:
+    - honeypot.enabled | default(false)
+    - (honeypot.port | int) != (effective_ssh_port | int)
+
+# 启用 Cloudflare UFW 时，cloudflare_ufw role 接管这些端口（默认 80/443），
+# 这里不再以 0.0.0.0/0 放行，否则会和 CF IP 段规则冲突（更宽的规则赢）。
+- name: 计算被 cloudflare_ufw 接管的端口集合
+  ansible.builtin.set_fact:
+    cf_managed_ports: >-
+      {{ (cloudflare_ufw.ports | default([80, 443]))
+         | map('string') | list
+         if (cloudflare_ufw.enabled | default(false))
+         else [] }}
+
+# 增量同步：present 的 ensure 放行；absent 的 ensure 删除。
+# 下次只要在 config.yml 加一行 → ./run.sh -t ufw 就能补上。
+- name: "应用放行规则（state: present，跳过 CF 接管端口）"
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    comment: "{{ item.comment | default('autosafe rule') }}"
+  loop: "{{ ufw.allow_rules | default([]) }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto | default('tcp') }} - {{ item.comment | default('') }}"
+  when:
+    - (item.state | default('present')) == 'present'
+    - (item.port | string) not in cf_managed_ports
+
+- name: "删除规则（state: absent）"
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    delete: true
+  loop: "{{ ufw.allow_rules | default([]) }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto | default('tcp') }} - {{ item.comment | default('') }}"
+  when: (item.state | default('present')) == 'absent'
+
+# 如果 ufw.allow_rules 里有 CF 接管端口的旧规则（之前手动加过 0.0.0.0/0 的 80/443），
+# 启用 cloudflare_ufw 后这些规则会变成"全网放行"漏洞，需要主动清理。
+- name: "清理被 CF 接管端口的旧全网规则（防绕过）"
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    delete: true
+  loop: "{{ ufw.allow_rules | default([]) }}"
+  loop_control:
+    label: "purge {{ item.port }}/{{ item.proto | default('tcp') }} (managed by cloudflare_ufw)"
+  when:
+    - cloudflare_ufw.enabled | default(false)
+    - (item.port | string) in cf_managed_ports
+
+- name: 禁止 ICMP（ping）
+  ansible.builtin.lineinfile:
+    path: /etc/ufw/before.rules
+    regexp: '^-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT'
+    line: '-A ufw-before-input -p icmp --icmp-type echo-request -j DROP'
+    backrefs: false
+  when: ufw.disable_ping | default(false)
+  notify: Reload ufw
+
+- name: 启用 UFW
+  community.general.ufw:
+    state: enabled
+    logging: low
+
+- name: 汇总当前放行的规则到报告
+  ansible.builtin.set_fact:
+    ufw_allow_summary: >-
+      {{ (ufw.allow_rules | default([]))
+         | selectattr('state', 'undefined')
+         | list
+         + (ufw.allow_rules | default([]))
+         | selectattr('state', 'defined')
+         | selectattr('state', 'equalto', 'present')
+         | list }}
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          'UFW 已启用，放行端口：' ~ effective_ssh_port ~ ', '
+          ~ (ufw_allow_summary | map(attribute='port') | map('string') | join(', '))
+        ]
+      }) }}

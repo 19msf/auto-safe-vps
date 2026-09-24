@@ -1,0 +1,23 @@
+# Fail2ban action：封禁/解封时调用通用 notify 脚本
+[Definition]
+
+actionstart =
+actionstop =
+actioncheck =
+
+{% if login_notify.events.fail2ban_ban | default(true) %}
+actionban  = /opt/scripts/notify.sh fail2ban_ban "🚫 Fail2ban 封禁" "Jail=<name>" "IP=<ip>" "Port=<port>" "Failures=<failures>" "时间=$(date +'%%Y-%%m-%%d %%H:%%M:%%S')"
+{% else %}
+actionban  =
+{% endif %}
+
+{% if login_notify.events.fail2ban_unban | default(false) %}
+actionunban = /opt/scripts/notify.sh fail2ban_unban "✅ Fail2ban 解封" "Jail=<name>" "IP=<ip>" "时间=$(date +'%%Y-%%m-%%d %%H:%%M:%%S')"
+{% else %}
+actionunban =
+{% endif %}
+
+[Init]
+name = default
+port = ssh
+protocol = tcp

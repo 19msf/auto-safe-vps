@@ -1,0 +1,20 @@
+---
+- name: 安装 unattended-upgrades
+  ansible.builtin.apt:
+    name:
+      - unattended-upgrades
+      - apt-listchanges
+    state: present
+
+- name: 启用自动安全更新配置
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: "{{ host_report | combine({'actions': host_report.actions + ['已开启自动安全更新']}) }}"

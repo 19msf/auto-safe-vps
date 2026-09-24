@@ -1,0 +1,17 @@
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+filter = sshd
+port = {{ effective_ssh_port }}
+maxretry = {{ fail2ban.maxretry | default(5) }}
+findtime = {{ fail2ban.findtime | default(300) }}
+bantime = {{ fail2ban.bantime | default(600) }}
+banaction = iptables-multiport
+{% if login_notify.enabled | default(true) and (login_notify.events.fail2ban_ban | default(true) or login_notify.events.fail2ban_unban | default(false)) %}
+# 在默认 action 之外追加 webhook 通知
+action = %(action_)s
+         autosafe-webhook[name=%(__name__)s, port="%(port)s", protocol="%(protocol)s"]
+{% endif %}
+backend = systemd

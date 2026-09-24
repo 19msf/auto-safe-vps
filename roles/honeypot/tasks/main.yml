@@ -1,0 +1,83 @@
+---
+# honeypot：在 22 端口监听，记录所有连接尝试 + webhook 通知（带防刷）
+- name: 安装 socat
+  ansible.builtin.apt:
+    name:
+      - socat
+    state: present
+
+- name: 安装 honeypot 启动脚本（带通知，节流防刷）
+  ansible.builtin.copy:
+    dest: /usr/local/bin/ssh-honeypot.sh
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # 蜜罐：监听 {{ honeypot.port }}，记录连接来源 IP；命中即发 webhook（带节流）
+      LOG="{{ honeypot.log_path }}"
+      THROTTLE_DIR="/run/ssh-honeypot"
+      THROTTLE_SEC={{ login_notify.honeypot_throttle_seconds | default(60) }}
+      mkdir -p "$(dirname "$LOG")" "$THROTTLE_DIR"
+
+      handler() {
+        ts="$(date -Iseconds)"
+        peer="${SOCAT_PEERADDR:-unknown}"
+        port="${SOCAT_PEERPORT:-?}"
+        echo "${ts} honeypot hit from ${peer}:${port}" >> "$LOG"
+      {% if login_notify.enabled | default(true) and login_notify.events.honeypot_hit | default(true) %}
+        # 节流：同一来源 IP 在 ${THROTTLE_SEC}s 内只通知一次
+        marker="${THROTTLE_DIR}/${peer}"
+        now=$(date +%s)
+        last=0
+        [ -f "$marker" ] && last=$(cat "$marker" 2>/dev/null || echo 0)
+        if [ $((now - last)) -ge "$THROTTLE_SEC" ]; then
+          echo "$now" > "$marker"
+          /opt/scripts/notify.sh honeypot_hit "🍯 蜜罐被触发" \
+            "来源IP=${peer}" \
+            "来源端口=${port}" \
+            "监听端口={{ honeypot.port }}" \
+            "时间=${ts}" &
+        fi
+      {% endif %}
+        exit 0
+      }
+      export -f handler
+
+      exec /usr/bin/socat -T1 TCP-LISTEN:{{ honeypot.port }},reuseaddr,fork \
+        SYSTEM:'bash -c handler'
+
+- name: 写入 systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssh-honeypot.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=SSH Honeypot (autosafe)
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/ssh-honeypot.sh
+      Restart=on-failure
+      RestartSec=3
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: 启用并启动 honeypot
+  ansible.builtin.systemd:
+    name: ssh-honeypot
+    daemon_reload: true
+    enabled: true
+    state: restarted
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          '蜜罐已启用，监听端口 ' ~ honeypot.port ~
+          '；命中会写日志 ' ~ honeypot.log_path ~
+          ' 并发 webhook（节流 ' ~
+          (login_notify.honeypot_throttle_seconds | default(60)) ~ 's）'
+        ]
+      }) }}

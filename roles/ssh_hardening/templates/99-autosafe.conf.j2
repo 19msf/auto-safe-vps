@@ -1,0 +1,13 @@
+# 由 auto-safe-vps 自动生成；优先级最高的 drop-in
+# 注意：这里**不写 Port 指令**——切端口由 change_port.yml 单独负责。
+PermitRootLogin {{ ssh.permit_root_login | default('no') }}
+PasswordAuthentication {{ ssh.password_authentication | default('no') }}
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+MaxAuthTries 3

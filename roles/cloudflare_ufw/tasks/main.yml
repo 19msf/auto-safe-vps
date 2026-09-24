@@ -1,0 +1,90 @@
+---
+# cloudflare_ufw: 把 80/443 锁到 Cloudflare IP 段，防止源站直连绕过 CF
+# 依赖：ufw 已启用（roles/ufw 已跑过）；notify role 提供 /opt/scripts/notify.sh（可选）
+
+- name: 校验启用前置条件
+  ansible.builtin.assert:
+    that:
+      - cloudflare_ufw.ports | length > 0
+    fail_msg: "cloudflare_ufw.ports 不能为空"
+
+- name: 确保 curl 已安装
+  ansible.builtin.apt:
+    name: curl
+    state: present
+
+- name: 确保 /opt/scripts 目录存在
+  ansible.builtin.file:
+    path: /opt/scripts
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: 确保状态目录存在
+  ansible.builtin.file:
+    path: "{{ cloudflare_ufw_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: 安装同步脚本
+  ansible.builtin.copy:
+    src: sync-cf-ufw.sh
+    dest: "{{ cloudflare_ufw_script_path }}"
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: 安装 systemd service
+  ansible.builtin.template:
+    src: cf-ufw-sync.service.j2
+    dest: /etc/systemd/system/cf-ufw-sync.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart cf-ufw-sync timer
+
+- name: 安装 systemd timer
+  ansible.builtin.template:
+    src: cf-ufw-sync.timer.j2
+    dest: /etc/systemd/system/cf-ufw-sync.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart cf-ufw-sync timer
+
+- name: 立即触发 Reload + Restart timer（落地新 unit）
+  ansible.builtin.meta: flush_handlers
+
+- name: 首次同步：立即跑一次脚本
+  ansible.builtin.command: "{{ cloudflare_ufw_script_path }}"
+  environment:
+    CF_UFW_PORTS: "{{ cloudflare_ufw.ports | join(',') }}"
+    CF_UFW_IPV4_URL: "{{ cloudflare_ufw.ipv4_url }}"
+    CF_UFW_IPV6_URL: "{{ cloudflare_ufw.ipv6_url }}"
+    CF_UFW_IPV6: "{{ 'true' if cloudflare_ufw.ipv6 else 'false' }}"
+    CF_UFW_STATE_DIR: "{{ cloudflare_ufw_state_dir }}"
+    CF_UFW_COMMENT: "{{ cloudflare_ufw_comment_tag }}"
+  register: cf_sync_run
+  changed_when: "'applied' in (cf_sync_run.stdout | default(''))"
+  failed_when: cf_sync_run.rc != 0
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          'Cloudflare UFW 已启用：端口 ' ~ (cloudflare_ufw.ports | join(',')) ~
+          ' 仅允许 CF IP 段，timer 周期 ' ~ cloudflare_ufw.sync_interval ~
+          (' (含 IPv6)' if cloudflare_ufw.ipv6 else ' (仅 IPv4)')
+        ],
+        'warnings': host_report.warnings + [
+          '注意：80/443 已锁定 CF IP，源站直连会被拒。请确认 DNS 已开橙云（Proxied）'
+        ]
+      }) }}

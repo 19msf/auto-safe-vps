@@ -1,0 +1,193 @@
+# =====================================================
+# VPS 安全加固 —— 全局配置（示例）
+# 复制为 config.yml 后再修改：
+#   cp config.yml.example config.yml
+# 中文注释，按需取消 enabled 字段。
+# =====================================================
+
+# ----------- 1. 新建管理员账号 -----------
+admin_user:
+  name: deploy                       # 新建的非 root 账户名
+  # 必填：管理员明文密码（建议 16 位以上，大小写+数字+符号）
+  # 不会随机生成；如果留空，剧本会直接报错并停止
+  password: ""
+  # sudo 是否免密码：
+  #   false（默认）—— 安全，每次 sudo 要密码；ansible 跑时需要 -K 传入密码
+  #   true        —— 便利，自动化场景推荐；权衡：deploy 账号被攻陷可直接提 root
+  # 本项目已禁掉 SSH 密码登录、只走公钥 + ufw 白名单 + fail2ban，
+  # 所以单机 deploy 账号被远程攻陷的难度已经非常高，自动化场景设 true 是合理权衡。
+  nopasswd_sudo: false
+  # 本地的 SSH 公钥（可填多个，会全部写入 ~/.ssh/authorized_keys）
+  # 支持三种写法：
+  #   1) 直接写整段公钥（推荐）
+  #   2) 用 lookup('file', '路径') 从控制端文件读取
+  #   3) 留空数组：仅当目标账号已经有有效 authorized_keys 时才可继续加固
+  ssh_public_keys: []
+    # - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@laptop"
+    # - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@desktop"
+    # - "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"   # 从本地文件读取
+    # - "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+
+# ----------- 2. SSH 加固 -----------
+ssh:
+  port: 2233                           # 目标 SSH 端口（仅 ./run.sh --change-port 时生效）
+  # SSH 改端口的流程（与 site.yml 解耦，避免锁死）：
+  #   1) 第一次部署：./run.sh，sshd 维持 22，inventory ansible_port=22
+  #   2) 跑通整机后：./run.sh --change-port，单独切端口
+  #   3) 切完后手动改 inventory.ini 的 ansible_port=2233 ansible_user=deploy
+  #   4) 再跑 ./run.sh，UFW / fail2ban 会自动同步到新端口
+  permit_root_login: "no"              # no / prohibit-password
+  password_authentication: "no"        # 仅密钥登录
+  # 限定 SSH 登录 IP（白名单）。留空数组则不限制；
+  # 写入后会在 UFW 中只放行这些来源到 SSH 端口。
+  # 首次部署务必留空；确认新管理员公钥登录正常后再逐步添加。
+  allowed_ips: []
+    # - "203.0.113.10/32"                # 例如：常用出口 IP
+    # - "198.51.100.0/24"                # 例如：办公网段
+
+# ----------- 3. fail2ban -----------
+fail2ban:
+  enabled: true
+  maxretry: 6
+  findtime: 300
+  bantime: 600                         # 单位秒，-1 永久封禁
+
+# ----------- 4. UFW 防火墙 -----------
+# 这个 role 是「增量同步」的：每次跑 -t ufw 都会按当前列表 ensure 规则；
+# 想新增端口直接编辑这里再 ./run.sh -t ufw 即可；
+# 想删除某条，必须保留该行并把 state 改为 "absent" 后运行 ufw role；
+# 直接从列表删行不会删除目标机上已经存在的 UFW 规则。
+ufw:
+  enabled: true
+  allow_rules:
+    # SSH 新端口由 ssh_hardening / limit_ssh_ip 自行处理，这里不重复写
+    # 注意：当 cloudflare_ufw.enabled=true 时，下面的 80/443 会被自动跳过 + 清理，
+    # 改由 cloudflare_ufw role 接管（仅放行 CF IP 段），防止源站直连绕过 CF。
+    - { port: 80,   proto: tcp, comment: "HTTP",            state: "present" }
+    - { port: 443,  proto: tcp, comment: "HTTPS",           state: "present" }
+    # 雷池和 1Panel 会在启用后由各自 role 动态放行实际端口，不需要预先开放。
+    # 1Panel v2 使用随机端口，写死 8888 已无意义。
+    # - { port: 8888, proto: tcp, comment: "1Panel",          state: "present" }
+    # 示例：要关掉某端口，把 state 改成 absent（无需删行，便于审计）
+    # - { port: 8080, proto: tcp, comment: "old service",   state: "absent"  }
+  disable_ping: true                   # 禁止 ICMP（ping）
+
+# ----------- 5. 蜜罐（伪装的旧 SSH 端口 22） -----------
+# 注意：honeypot.port 不能与当前 SSH 端口（inventory 的 ansible_port）冲突。
+# 推荐流程：第一次部署保持 false；跑完 ./run.sh --change-port 切到新端口、改完 inventory 后再开启。
+honeypot:
+  enabled: false                       # 第一次部署保持 false；切完 SSH 端口后再改 true
+  port: 22                             # 监听 22，所有连接立即记录并拒绝
+  log_path: /var/log/ssh-honeypot.log
+
+# ----------- 6. 通知（PAM + Fail2ban + 蜜罐 共用同一个 webhook）-----------
+# 默认开启。如需关闭，把 enabled 设为 false。
+# 任何接收 JSON POST 的 webhook 都可以（企业微信 / 飞书 / Slack / 自建）。
+login_notify:
+  enabled: true
+  # 必填：webhook URL（缺失则剧本报错）
+  # 飞书自定义机器人地址格式：
+  #   https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>
+  # 获取方法：飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 webhook 地址
+  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE_WITH_YOUR_TOKEN"
+  # 消息模板风格，飞书(feishu) / 企业微信(qywx) / slack / generic
+  # 默认 feishu
+  style: "feishu"
+  # 触发会话类型；通常无需改
+  pam_type: "open_session"
+  # curl 超时（秒），防止登录卡顿
+  connect_timeout: 3
+  max_time: 10
+  # 哪些事件需要发通知（同一个 webhook 接收）
+  events:
+    ssh_login: true                    # SSH 登录成功
+    fail2ban_ban: true                 # fail2ban 封禁某 IP
+    fail2ban_unban: false              # fail2ban 解封某 IP
+    honeypot_hit: true                 # 蜜罐被探测/连接
+  # 蜜罐通知防刷：N 秒内同一 IP 只通知一次
+  honeypot_throttle_seconds: 60
+
+# ----------- 7. 自动安全更新 -----------
+unattended_upgrades:
+  enabled: true
+
+# ----------- 8. BBR + 网络优化 -----------
+bbr:
+  enabled: true                        # 开启 BBR（系统内核 >=4.9）
+  # 注：默认假设主机自带三网优化，所以不再做额外 sysctl 调优；
+  #     如果想再加可以在 group_vars/all.yml 里覆盖 bbr_extra_sysctl。
+
+# ----------- 9. Cloudflare UFW 锁定（防源站 IP 绕过） -----------
+# 仅在域名已开 Cloudflare 橙云（Proxied）时启用！
+# 启用后：
+#   - UFW 的 80/443 不再放给 0.0.0.0/0，只放给 Cloudflare 官方 IP 段
+#   - systemd timer 每隔 sync_interval 自动从 cloudflare.com 拉最新 IP 列表
+#   - 拉取失败保留旧规则 + 发 webhook 告警（不会自动放开 80/443）
+# 注意：
+#   - 启用前先确认 DNS 已 Proxied，否则源站 80/443 直接被锁死，网站无法访问
+#   - 雷池 WAF / 反代如果跑在 80/443，必须配置 set_real_ip_from + CF-Connecting-IP
+#     才能拿到访客真实 IP（控制台 → 站点 → 可信代理 IP 填 CF 段）
+cloudflare_ufw:
+  enabled: false
+  ports:
+    - 80
+    - 443
+  ipv4_url: "https://www.cloudflare.com/ips-v4"
+  ipv6_url: "https://www.cloudflare.com/ips-v6"
+  ipv6: true
+  sync_interval: "6h"                  # systemd timer 触发周期，可写 1h / 30min / 12h 等
+
+# ----------- 10. 长亭雷池 WAF（Docker 部署） -----------
+# 注意：雷池 setup.sh 装完会随机生成初始账号密码（mgt-cli reset-admin --once）。
+# 本剧本不再尝试同步 config 里的账号密码到雷池（不同版本支持的参数差异大、不稳定），
+# 而是从安装日志解析出真实随机账号密码，写进最终报告。
+# 想改账号 / 密码：登录控制台手动改，或在 VPS 上跑：
+#   sudo docker exec safeline-mgt resetadmin                                    # 重置随机
+#   sudo docker exec safeline-mgt resetadmin --username U --password P          # 新版才支持
+#   sudo docker exec safeline-mgt resetadmin --help                             # 自查参数
+safeline_waf:
+  enabled: false                        # 基础加固默认不额外部署管理面板，按需开启
+  console_port: 9443                   # 控制台端口（ufw 会按这个端口放行）
+  release: "lts"                       # latest / lts
+  # 以下字段已废弃；保留只为向后兼容（不再读取）。
+  # admin_user: "admin"
+  # admin_password: "..."
+
+# ----------- 11. 1Panel 面板 -----------
+# 注意：1Panel v2 官方 install.sh 不支持任何静默 / 参数化安装（这是上游设计，
+# 不是本剧本的限制）。安装时端口 / 入口 / 账号 / 密码全部由 install.sh 随机生成。
+# 本剧本会：
+#   1) 装完后用 `1pctl user-info` 解析真实端口 / 入口 / 账号 / 密码
+#   2) 把真实端口加进 ufw 放行
+#   3) 把账号 / 密码 / 完整访问地址写进最终报告
+# 想改账号 / 密码 / 端口：登录控制台手动改，或在 VPS 上跑：
+#   sudo 1pctl update password   # 改密码
+#   sudo 1pctl update username   # 改用户名
+#   sudo 1pctl update port       # 改端口（改完记得 ufw allow 新端口、删旧端口）
+#   （改 entrance 安全入口需在控制台 → 面板设置 → 安全入口）
+one_panel:
+  enabled: false                        # 基础加固默认不额外部署管理面板，按需开启
+  # 注意：以下字段已废弃（v2 不支持参数化安装），保留只为向后兼容；
+  # 改值不会生效，请按上面的提示登录控制台或用 1pctl 命令调整。
+  # custom_port: "8888"
+  # custom_entrance: "secret"
+  # custom_username: "admin"
+  # custom_password: "..."
+
+# ----------- 12. SSL 证书模板（防 IP 泄露） -----------
+ssl_template:
+  enabled: false                       # 默认不直接部署，仅生成 nginx 模板
+  domain: "example.com"                # 待保护的域名
+  email: "you@example.com"             # acme.sh 注册邮箱
+  cert_method: "acme.sh"               # acme.sh / certbot
+  webroot: "/var/www/html"
+  # 渲染后的 nginx 模板会落到 /etc/nginx/templates/ssl-default.conf.example
+  # 需手动检查并 reload nginx——避免误覆盖现网配置
+
+# ----------- 13. WireGuard（占位，待补） -----------
+wireguard:
+  enabled: false                       # TODO：当前不自动部署，详见 docs/TODO.md
+
+# ----------- 报告输出位置（控制端本地） -----------
+report:
+  output_dir: "./reports"

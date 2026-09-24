@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync Cloudflare IP list to UFW (autosafe)
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CF_UFW_PORTS={{ cloudflare_ufw.ports | join(',') }}
+Environment=CF_UFW_IPV4_URL={{ cloudflare_ufw.ipv4_url }}
+Environment=CF_UFW_IPV6_URL={{ cloudflare_ufw.ipv6_url }}
+Environment=CF_UFW_IPV6={{ 'true' if cloudflare_ufw.ipv6 else 'false' }}
+Environment=CF_UFW_STATE_DIR={{ cloudflare_ufw_state_dir }}
+Environment=CF_UFW_COMMENT={{ cloudflare_ufw_comment_tag }}
+ExecStart={{ cloudflare_ufw_script_path }}
+
+[Install]
+WantedBy=multi-user.target

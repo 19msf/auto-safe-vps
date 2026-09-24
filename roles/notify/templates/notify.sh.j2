@@ -1,0 +1,70 @@
+#!/bin/bash
+# 通用通知脚本（auto-safe-vps）
+# 用法：notify.sh <event> <title> <kv1=val1> <kv2=val2> ...
+#   event: ssh_login | fail2ban_ban | fail2ban_unban | honeypot_hit | generic
+# 示例：
+#   notify.sh ssh_login "SSH 登录" user=root from=1.2.3.4 time="2026-01-01 12:00:00"
+
+set +e
+[ -f /etc/autosafe-webhook.env ] && . /etc/autosafe-webhook.env
+[ -z "$WEBHOOK_URL" ] && exit 0
+
+event="${1:-generic}"
+title="${2:-通知}"
+shift 2 || true
+
+local_hostname=$(hostname)
+local_ip=$(curl -s --connect-timeout "${CONNECT_TIMEOUT:-3}" ifconfig.me 2>/dev/null || echo "unknown")
+
+# 工具：把 a=b c=d 列表打印成 "a: b\nc: d"
+join_lines() {
+  local out=""
+  for kv in "$@"; do
+    out="${out}${kv%%=*}: ${kv#*=}\n"
+  done
+  printf '%s' "$out"
+}
+
+# 工具：把字符串安全转成 JSON 字符串字面量（含引号）
+json_str() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))'
+  else
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g' \
+      | awk 'BEGIN{printf "\""} {printf "%s",$0} END{printf "\""}'
+  fi
+}
+
+case "${STYLE:-feishu}" in
+  feishu)
+    # 飞书自定义群机器人 - text 类型
+    text=$(printf "%s\n机器: %s (%s)\n%b" "$title" "$local_hostname" "$local_ip" "$(join_lines "$@")")
+    safe=$(printf '%s' "$text" | json_str)
+    payload="{\"msg_type\":\"text\",\"content\":{\"text\":${safe}}}"
+    ;;
+  qywx)
+    body=""
+    for kv in "$@"; do body="${body}> **${kv%%=*}**: ${kv#*=}\n"; done
+    payload="{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"### ${title}\n> **机器**: ${local_hostname} (${local_ip})\n${body}\"}}"
+    ;;
+  slack)
+    flat=$(join_lines "$@" | tr '\n' ' ')
+    payload="{\"text\":\"${title}\n机器: ${local_hostname} (${local_ip})\n${flat}\"}"
+    ;;
+  *)
+    json_kv=""
+    for kv in "$@"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      json_kv="${json_kv},\"${k}\":\"${v}\""
+    done
+    payload="{\"event\":\"${event}\",\"host\":\"${local_hostname}\",\"public_ip\":\"${local_ip}\"${json_kv}}"
+    ;;
+esac
+
+curl -s -X POST "$WEBHOOK_URL" \
+  --connect-timeout "${CONNECT_TIMEOUT:-3}" \
+  --max-time "${MAX_TIME:-10}" \
+  -H "Content-Type: application/json" \
+  -d "$payload" \
+  > /dev/null 2>&1
+exit 0

@@ -1,0 +1,31 @@
+# 真实配置文件（敏感信息），不入仓库
+inventory.ini
+config.yml
+group_vars/all/vault.yml
+
+# 生成的报告文件
+reports/
+*.report.md
+
+# Ansible 临时文件
+*.retry
+.ansible/
+*.log
+.facts_cache/
+collections/
+.ansible-lint
+
+# 密钥/证书
+*.pem
+*.key
+*.crt
+ssh_keys/
+wireguard_keys/
+
+# OS / 编辑器
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.swp
+.claude

@@ -1,0 +1,16 @@
+---
+# 用户在 config.yml 里覆盖的字段
+cloudflare_ufw:
+  enabled: false
+  ports:
+    - 80
+    - 443
+  ipv4_url: "https://www.cloudflare.com/ips-v4"
+  ipv6_url: "https://www.cloudflare.com/ips-v6"
+  ipv6: true
+  sync_interval: "6h"
+
+# 内部固定字段（独立变量，不会被用户的 cloudflare_ufw dict 覆盖）
+cloudflare_ufw_state_dir: /var/lib/cf-ufw
+cloudflare_ufw_script_path: /opt/scripts/sync-cf-ufw.sh
+cloudflare_ufw_comment_tag: "cf-allow"

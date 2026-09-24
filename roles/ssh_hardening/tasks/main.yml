@@ -1,0 +1,45 @@
+---
+# ssh_hardening：使用 drop-in 配置（避免动 /etc/ssh/sshd_config 主文件）
+#
+# 这个 role 永远只做"非端口"的安全加固：禁 root、禁密码、公钥登录、各种超时。
+# **改 SSH 端口是另一个独立 playbook**：change_port.yml（用 ./run.sh --change-port）。
+#
+# 设计原因：把"改端口"这个唯一不可逆 + 容易锁死的操作隔离到独立 playbook，
+# 让 site.yml 可以反复幂等执行，不用担心连接被切。
+
+- name: 检查是否存在云厂商的 sshd_config.d 配置
+  ansible.builtin.find:
+    paths: /etc/ssh/sshd_config.d
+    patterns: "*.conf"
+  register: ssh_hardening_sshd_d_files
+
+- name: 备份并禁用云厂商默认 drop-in（如 50-cloud-init.conf；幂等：已禁用则跳过）
+  ansible.builtin.command: "mv {{ item.path }} {{ item.path }}.disabled-by-autosafe"
+  args:
+    creates: "{{ item.path }}.disabled-by-autosafe"
+  loop: "{{ ssh_hardening_sshd_d_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when:
+    - item.path is search('cloud-init|cloudimg')
+
+- name: 写入加固版 SSH drop-in 配置（带 validate；语法错则不落盘）
+  ansible.builtin.template:
+    src: 99-autosafe.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-autosafe.conf
+    mode: "0644"
+    validate: "sshd -t -f %s"
+  register: ssh_hardening_dropin
+  notify: Restart ssh
+
+- name: 立即触发 sshd 重启让禁 root / 禁密码生效
+  ansible.builtin.meta: flush_handlers
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          'SSH 加固已应用：禁 root 登录、禁密码登录、仅公钥（端口仍为 ' ~ effective_ssh_port ~ '）'
+        ]
+      }) }}

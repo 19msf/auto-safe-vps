@@ -1,0 +1,47 @@
+---
+# ssl_template：仅生成 nginx 模板和 acme.sh，不主动 reload，避免覆盖现网
+- name: 安装 nginx（如未安装）
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+
+- name: 安装 acme.sh（如未安装）
+  ansible.builtin.shell: |
+    set -eo pipefail
+    if [ ! -d /root/.acme.sh ]; then
+      curl -s https://get.acme.sh | sh -s email={{ ssl_template.email }}
+    fi
+  args:
+    executable: /bin/bash
+    creates: /root/.acme.sh/acme.sh
+  when: ssl_template.cert_method | default('acme.sh') == 'acme.sh'
+
+- name: 生成 nginx 配置模板（仅模板，不启用）
+  ansible.builtin.template:
+    src: ssl-default.conf.j2
+    dest: "/etc/nginx/templates/ssl-default.conf.example"
+    mode: "0644"
+
+- name: 准备说明文件
+  ansible.builtin.copy:
+    dest: /etc/nginx/templates/README-autosafe.md
+    mode: "0644"
+    content: |
+      # SSL 模板说明（自动生成）
+      1. 用 acme.sh 申请证书：
+         /root/.acme.sh/acme.sh --issue -d {{ ssl_template.domain }} --webroot {{ ssl_template.webroot }}
+         /root/.acme.sh/acme.sh --install-cert -d {{ ssl_template.domain }} \
+           --key-file       /etc/nginx/ssl/{{ ssl_template.domain }}.key \
+           --fullchain-file /etc/nginx/ssl/{{ ssl_template.domain }}.crt \
+           --reloadcmd      "systemctl reload nginx"
+      2. 把 ssl-default.conf.example 拷贝/修改为站点的 conf：
+         cp ssl-default.conf.example /etc/nginx/conf.d/{{ ssl_template.domain }}.conf
+      3. nginx -t && systemctl reload nginx
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + ['SSL 模板已生成于 /etc/nginx/templates/'],
+        'warnings': host_report.warnings + ['SSL 模板需要手动检查并应用，避免覆盖现网 nginx 配置']
+      }) }}

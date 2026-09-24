@@ -1,0 +1,167 @@
+---
+# =====================================================
+# 单独切换 SSH 端口的 Playbook
+# 用法： ./run.sh --change-port --ask-become-pass
+#       或直接： ansible-playbook -i inventory.ini change_port.yml -K
+#
+# 这个 playbook **只做一件事**：把 sshd 监听端口从 inventory 的 ansible_port 切到 ssh.port。
+# - 不改其他任何安全配置（root / 密码 / 公钥那些由 site.yml 的 ssh_hardening role 负责）
+# - 不动 UFW / fail2ban / limit_ssh_ip （切完端口后用户手改 inventory，重跑 site.yml 即可同步）
+#
+# 为什么要 --ask-become-pass：
+#   - 哪怕 deploy 账号已经 NOPASSWD sudo（config.yml 的 nopasswd_sudo=true），
+#     也建议带上 -K，作为兜底（比如运维换了非免密账号、或临时用别的 inventory）。
+#     deploy 已经免密时 -K 会被忽略，不会出错。
+#
+# 为什么独立成一个 playbook：
+# 1. site.yml 可以反复幂等执行不影响线上，改端口是一次性 + 容易锁死的操作，应该被显式触发
+# 2. Debian 12 / Ubuntu 22.10+ 的 socket activation 机制需要单独处理（关 ssh.socket）
+# 3. 改端口后必须 wait_for + reset_connection，跟一般任务的执行模型不同
+# =====================================================
+
+- name: 切换 SSH 端口
+  hosts: vps
+  gather_facts: true
+  vars_files:
+    - config.yml
+  tasks:
+    - name: 校验配置
+      ansible.builtin.assert:
+        that:
+          - ssh.port | default(0) | int >= 1
+          - ssh.port | default(0) | int <= 65535
+          - (ssh.port | int) != (honeypot.port | default(22) | int) or not (honeypot.enabled | default(false))
+        fail_msg: |
+          [配置错误] ssh.port 必须 1-65535；不能与 honeypot.port 冲突（除非 honeypot 关闭）
+
+    - name: 显示当前 inventory 的 SSH 端口与目标端口
+      ansible.builtin.debug:
+        msg: >-
+          当前 inventory ansible_port={{ ansible_port | default(22) }}，
+          目标 ssh.port={{ ssh.port }}；
+          {% if (ansible_port | default(22) | int) == (ssh.port | int) -%}
+          端口相同，无需切换（如果 sshd 实际端口确实是 {{ ssh.port }} 这一步会快速跳过）{%- else -%}
+          将切换到新端口{%- endif %}
+
+    - name: 检查 ssh.socket 是否存在（Debian 12+ / Ubuntu 22.10+ 默认 socket activation）
+      ansible.builtin.stat:
+        path: /lib/systemd/system/ssh.socket
+      register: ssh_hardening_socket_unit
+
+    - name: 关掉 socket activation 并让 ssh.service 接管（仅当 ssh.socket 存在）
+      when: ssh_hardening_socket_unit.stat.exists
+      block:
+        # 思路：systemd 的 ssh.service 默认 Requires=ssh.socket（Ubuntu 24.04），
+        # 不能简单 mask socket 否则 service 起不来。正确做法是：
+        # 1) 先确保 ssh.service drop-in 解除对 socket 的硬依赖
+        # 2) unmask（如果之前被 mask 过）+ stop + disable ssh.socket（不 mask）
+        # 3) 显式 enable + start ssh.service
+        - name: 创建 ssh.service 的 drop-in 目录
+          ansible.builtin.file:
+            path: /etc/systemd/system/ssh.service.d
+            state: directory
+            mode: "0755"
+
+        - name: 写 ssh.service 的 drop-in，去掉对 ssh.socket 的依赖
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/ssh.service.d/override.conf
+            mode: "0644"
+            content: |
+              [Unit]
+              Requires=
+              Wants=
+              After=network.target
+          register: change_port_service_override
+
+        - name: 重新载入 systemd 配置（任何 unit 文件改动后必跑）
+          ansible.builtin.systemd:
+            daemon_reload: true
+
+        - name: 解除 ssh.socket 的 mask（如果之前被 mask 过）
+          ansible.builtin.systemd:
+            name: ssh.socket
+            masked: false
+          failed_when: false
+
+        - name: 停止并禁用 ssh.socket（不 mask，避免拖累 ssh.service）
+          ansible.builtin.systemd:
+            name: ssh.socket
+            state: stopped
+            enabled: false
+
+        - name: 启用并启动 ssh.service
+          ansible.builtin.systemd:
+            name: ssh.service
+            enabled: true
+            state: started
+
+    - name: 确保 /run/sshd 目录存在（sshd -T 检查需要）
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        mode: "0755"
+
+    - name: 写入端口配置（覆盖 99-autosafe.conf 的同时保留其他加固指令）
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/98-autosafe-port.conf
+        content: "Port {{ ssh.port }}\n"
+        mode: "0644"
+        validate: "sshd -t -f %s"
+      register: change_port_dropin
+
+    - name: 读取 sshd 实际生效的监听端口
+      ansible.builtin.command: sshd -T -C user=root
+      register: change_port_sshd_effective
+      changed_when: false
+      check_mode: false
+
+    - name: 解析 sshd 当前监听端口
+      ansible.builtin.set_fact:
+        change_port_current_ports: >-
+          {{ change_port_sshd_effective.stdout_lines
+             | select('match', '^port\s+')
+             | map('regex_replace', '^port\s+', '')
+             | map('trim')
+             | list }}
+
+    - name: 重启 sshd 让端口真正生效（端口不匹配或刚改了 drop-in）
+      ansible.builtin.systemd:
+        name: ssh.service
+        state: restarted
+        daemon_reload: true
+      when: >-
+        change_port_dropin.changed
+        or (ssh.port | string) not in change_port_current_ports
+
+    - name: 等待新 SSH 端口监听就绪（在远端本地 wait，避免 ansible 切端口连不上）
+      ansible.builtin.wait_for:
+        port: "{{ ssh.port }}"
+        host: 127.0.0.1
+        timeout: 30
+
+    # 切完 sshd 端口必须立即放行新端口，否则用户从外网连不上 → ansible 也连不上 → 锁死
+    # 旧端口的删除留给后续 site.yml（用户改完 inventory 再跑）
+    - name: UFW 立即放行新 SSH 端口（如果 ufw 已启用）
+      ansible.builtin.command: ufw allow "{{ ssh.port }}/tcp" comment "SSH (autosafe)"
+      register: change_port_ufw_allow
+      changed_when: "'Skipping' not in change_port_ufw_allow.stdout"
+      failed_when:
+        - change_port_ufw_allow.rc != 0
+        - "'inactive' not in change_port_ufw_allow.stderr | default('')"
+        - "'inactive' not in change_port_ufw_allow.stdout | default('')"
+      when: ufw.enabled | default(true)
+
+    - name: 提示下一步
+      ansible.builtin.debug:
+        msg: |
+          ✅ SSH 端口已切换到 {{ ssh.port }}。
+          {% if ufw.enabled | default(true) %}UFW 已放行新端口。{% else %}配置中 UFW 已关闭，请自行确认外部防火墙已放行新端口。{% endif %}
+
+          下一步必做：
+          1) 另一个终端验证：
+             ssh -p {{ ssh.port }} {{ admin_user.name }}@{{ ansible_host }}
+          2) 验证通过后改 inventory.ini：
+             vps1 ansible_host={{ ansible_host }} ansible_port={{ ssh.port }} ansible_user={{ admin_user.name }}
+          3) 想启用蜜罐占用 22：把 config.yml 的 honeypot.enabled 改 true，./run.sh -t ufw,honeypot
+             （22 端口 UFW 永远不删——这是给蜜罐留的；ufw role 是增量 add，不动既有规则）
+          4) 也可以直接跑 ./run.sh，让 fail2ban / limit_ssh_ip 等所有 role 同步到新端口

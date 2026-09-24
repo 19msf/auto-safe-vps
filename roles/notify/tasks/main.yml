@@ -1,0 +1,24 @@
+---
+# notify：通用通知脚本（被 login_notify / fail2ban / honeypot 共用）
+- name: 准备脚本目录
+  ansible.builtin.file:
+    path: /opt/scripts
+    state: directory
+    mode: "0755"
+
+- name: 写入通用通知脚本
+  ansible.builtin.template:
+    src: notify.sh.j2
+    dest: /opt/scripts/notify.sh
+    mode: "0755"
+
+- name: 写入 webhook URL（避免命令行可见）
+  ansible.builtin.copy:
+    dest: /etc/autosafe-webhook.env
+    mode: "0600"
+    content: |
+      WEBHOOK_URL={{ login_notify.webhook_url | quote }}
+      STYLE={{ login_notify.style | default('feishu') | quote }}
+      CONNECT_TIMEOUT="{{ login_notify.connect_timeout | default(3) }}"
+      MAX_TIME="{{ login_notify.max_time | default(10) }}"
+  no_log: true

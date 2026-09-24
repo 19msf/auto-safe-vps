@@ -1,0 +1,114 @@
+---
+# user：创建非 root 管理员账号 + sudo + 公钥（幂等）
+# 密码完全由用户在 config.yml 里指定，剧本不再生成随机密码。
+- name: 校验密码已配置
+  ansible.builtin.assert:
+    that:
+      - admin_user.password | default('') | length >= 8
+    fail_msg: "admin_user.password 缺失或长度 < 8，请在 config.yml 中填写。"
+
+- name: 检查管理员账号是否已存在
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ admin_user.name }}"
+    fail_key: false
+
+- name: 标记账号是否已存在
+  ansible.builtin.set_fact:
+    user_exists: "{{ ansible_facts.getent_passwd[admin_user.name] is not none }}"
+
+- name: 计算密码 hash
+  ansible.builtin.set_fact:
+    user_admin_hash: "{{ admin_user.password | password_hash('sha512') }}"
+  no_log: true
+
+- name: 确保 sudo 组存在
+  ansible.builtin.group:
+    name: sudo
+    state: present
+
+- name: 创建管理员账号（仅当不存在；存在则不重置密码）
+  ansible.builtin.user:
+    name: "{{ admin_user.name }}"
+    password: "{{ user_admin_hash }}"
+    groups: sudo
+    append: true
+    shell: /bin/bash
+    create_home: true
+    state: present
+    update_password: on_create   # 关键：已存在用户不覆盖密码
+  when: not user_exists
+
+- name: 已存在用户：仅确保在 sudo 组里
+  ansible.builtin.user:
+    name: "{{ admin_user.name }}"
+    groups: sudo
+    append: true
+  when: user_exists
+
+- name: 配置 sudoers
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ admin_user.name }}"
+    # nopasswd_sudo=true：sudo 不要密码，方便 ansible 自动化跑
+    # nopasswd_sudo=false（默认）：sudo 要密码，更安全；ansible 跑时需要 -K 传入
+    content: |
+      {{ admin_user.name }} ALL=(ALL:ALL) {{ 'NOPASSWD:ALL' if (admin_user.nopasswd_sudo | default(false)) else 'ALL' }}
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+- name: 写入授权公钥（支持多把；自动跳过空行）
+  ansible.posix.authorized_key:
+    user: "{{ admin_user.name }}"
+    state: present
+    key: "{{ item }}"
+  loop: "{{ admin_user.ssh_public_keys | default([]) | reject('match', '^\\s*$') | list }}"
+  when: admin_user.ssh_public_keys | default([]) | length > 0
+
+- name: 刷新管理员账号信息
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ admin_user.name }}"
+
+- name: 读取管理员实际家目录
+  ansible.builtin.set_fact:
+    user_admin_home: "{{ ansible_facts.getent_passwd[admin_user.name][4] }}"
+
+# 在后续 ssh_hardening 禁用 root / 密码登录前，必须确认新管理员确实有可用公钥。
+# 这里检查目标机上的最终 authorized_keys，因此既兼容本次新写入，也兼容已存在账号。
+- name: 验证管理员至少有一把有效 SSH 公钥
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -l
+      - -f
+      - "{{ user_admin_home }}/.ssh/authorized_keys"
+  register: user_authorized_keys_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: 防锁死检查——禁用 root 和密码登录前必须有有效管理员公钥
+  ansible.builtin.assert:
+    that:
+      - user_authorized_keys_check.rc == 0
+    fail_msg: |
+      [安全中止] {{ admin_user.name }} 没有可验证的 SSH 公钥，不能继续禁用 root/密码登录。
+      请在 config.yml 的 admin_user.ssh_public_keys 填入完整公钥后重跑。
+  when:
+    - (ssh.permit_root_login | default('no')) == 'no'
+    - (ssh.password_authentication | default('no')) == 'no'
+
+- name: 记录到报告（不显示明文密码，只标识来源）  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          ('管理员账号 ' ~ admin_user.name ~ ' 已存在，仅同步 sudo 组与公钥')
+          if user_exists else
+          ('创建管理员账号 ' ~ admin_user.name ~ '（密码来自 config.yml）')
+        ],
+        'credentials': host_report.credentials + [
+          {'item': '管理员账号', 'value': admin_user.name},
+          {'item': '管理员密码', 'value': '见 config.yml 中 admin_user.password'}
+        ]
+      }) }}

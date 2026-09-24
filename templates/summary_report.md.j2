@@ -1,0 +1,46 @@
+# VPS 安全加固 —— 汇总报告
+
+> 生成时间：{{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S"') }}
+> 主机数量：{{ all_reports | length }}
+
+---
+{% for r in all_reports %}
+
+## 主机：{{ r.host }}（{{ r.public_ip }}）
+
+### ✅ 已执行操作
+{% for a in r.actions %}
+- {{ a }}
+{% endfor %}
+
+### 🔑 凭据 / 关键信息
+| 项目 | 值 |
+|---|---|
+{% for c in r.credentials %}
+| {{ c.item }} | `{{ c.value }}` |
+{% endfor %}
+
+### 🌐 访问地址
+| 服务 | 地址 |
+|---|---|
+{% for ap in r.access_points %}
+| {{ ap.name }} | `{{ ap.address }}` |
+{% endfor %}
+
+### ⚠️ 注意事项 / 待手动完成
+{% for w in r.warnings %}
+- {{ w }}
+{% endfor %}
+
+---
+{% endfor %}
+
+## 安全建议
+1. **立即测试 SSH 新端口连接成功后再断开当前会话**，避免被锁在外面。
+2. 凭据归属：
+   - **管理员密码**：以 `config.yml` 中填写的值为准；报告不会回显明文。
+   - **雷池 WAF 密码**：由安装脚本随机生成；首次安装时会在上面的 credentials 段记录，登录后请立即修改。
+   - **1Panel 密码 / 端口 / 入口**：v2 上游不支持静默自定义安装，由 install.sh 随机生成；上面 credentials 段已写出真实值，**请登录后立刻改密码**（方法见 README「1Panel 面板运维」段）。
+   - 建议每台 VPS 使用不同密码并妥善保管。
+3. 蜜罐日志位于 `/var/log/ssh-honeypot.log`，可周期性查看异常 IP。
+4. 1Panel 与雷池 WAF 控制台请尽快启用 2FA（如支持）。

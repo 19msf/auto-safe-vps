@@ -1,0 +1,108 @@
+---
+# one_panel：1Panel v2 一键安装（幂等）
+#
+# 重要约定：
+#   - 1Panel v2 的 install.sh 不支持任何静默 / 参数化 / 环境变量预设安装
+#     （quick_start.sh 也不会把命令行参数传下去），所有配置项靠交互式 read。
+#     所以这里 **接受首次安装产出随机配置**（端口、入口、用户名、密码全是随机），
+#     装完后用 `1pctl user-info` 解析真实值，再做：
+#       1) 把真实端口加进 ufw 放行
+#       2) 把账号 / 密码 / 完整访问地址写进报告
+#       3) 给用户一条"请登录后自行修改账号密码端口"的警告
+#   - 不再读 config.yml 里 one_panel.custom_port/user/password/entrance（已过时）。
+#     用户改这些值需要登录控制台手动改，或用 `1pctl update {port|username|password}` 命令。
+
+- name: 检测 1Panel 是否已安装
+  ansible.builtin.stat:
+    path: /usr/local/bin/1pctl
+  register: one_panel_pctl
+
+- name: 下载并执行 1Panel 安装脚本（仅首次；交互问题用默认值，stdin 关闭跳过所有 read）
+  # 关键点：把 stdin 重定向到 /dev/null，install.sh 里所有 `read -p` 立即返回空，
+  # 走默认分支（默认目录 /opt、随机端口、随机入口、随机用户名、随机密码、自动安装 docker 等）。
+  # quick_start.sh 走官方源（resource.1panel.pro）；不带任何不被识别的参数。
+  ansible.builtin.shell: |
+    set -eo pipefail
+    cd /tmp
+    curl -fsSL https://resource.1panel.pro/v2/quick_start.sh -o quick_start.sh
+    bash quick_start.sh < /dev/null 2>&1 | tee /tmp/1panel-install.log
+    exit ${PIPESTATUS[0]}
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/1pctl
+  when: not one_panel_pctl.stat.exists
+  register: one_panel_install
+  changed_when: one_panel_install.rc | default(0) == 0
+
+- name: 等待 1panel-core 服务起来（最多 60 秒）
+  ansible.builtin.shell: |
+    set -e
+    for i in $(seq 1 30); do
+      if systemctl is-active --quiet 1panel-core 2>/dev/null; then exit 0; fi
+      sleep 2
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: 抓取 1Panel 真实运行信息（端口 / 入口 / 用户 / 密码）
+  ansible.builtin.command: 1pctl user-info
+  register: one_panel_userinfo
+  changed_when: false
+  no_log: true
+
+- name: 解析 1pctl user-info 输出
+  ansible.builtin.set_fact:
+    one_panel_real_port: "{{ one_panel_userinfo.stdout
+      | regex_search('Panel address:\\s*https?://[^:]+:(\\d+)/', '\\1')
+      | first | default('') }}"
+    one_panel_real_entrance: "{{ one_panel_userinfo.stdout
+      | regex_search('Panel address:\\s*https?://[^:]+:\\d+/(\\S+)', '\\1')
+      | first | default('') }}"
+    one_panel_real_user: "{{ one_panel_userinfo.stdout
+      | regex_search('Panel user:\\s*(\\S+)', '\\1')
+      | first | default('') }}"
+    one_panel_real_password: "{{ one_panel_userinfo.stdout
+      | regex_search('Panel password:\\s*(\\S+)', '\\1')
+      | first | default('') }}"
+  no_log: true
+
+- name: 校验解析结果
+  ansible.builtin.assert:
+    that:
+      - one_panel_real_port | length > 0
+      - (one_panel_real_port | regex_search('^[0-9]+$')) is not none
+    fail_msg: "未能从 `1pctl user-info` 解析到 1Panel 真实端口，请上 VPS 手动 `sudo 1pctl user-info` 看看输出格式。"
+
+- name: UFW 放行 1Panel 实际端口
+  community.general.ufw:
+    rule: allow
+    port: "{{ one_panel_real_port }}"
+    proto: tcp
+    comment: "1Panel"
+  when: ufw.enabled | default(true)
+
+- name: 记录到报告（密码是 1Panel 随机生成的，原样回传，方便用户登录后自行修改） # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          ('1Panel 已存在，未重新安装') if one_panel_pctl.stat.exists
+          else ('1Panel 已安装；端口/入口/账号/密码均为安装脚本随机生成')
+        ],
+        'access_points': host_report.access_points + [{
+          'name': '1Panel 面板',
+          'address': 'http://' ~ ansible_host ~ ':' ~ one_panel_real_port ~ '/' ~ one_panel_real_entrance
+        }],
+        'credentials': host_report.credentials + [
+          {'item': '1Panel 账号', 'value': one_panel_real_user},
+          {'item': '1Panel 密码', 'value': one_panel_real_password},
+          {'item': '1Panel 端口', 'value': one_panel_real_port},
+          {'item': '1Panel 入口', 'value': one_panel_real_entrance}
+        ],
+        'warnings': host_report.warnings + (
+          ['1Panel v2 不支持静默自定义安装；端口/入口/账号/密码均随机。强烈建议登录控制台后修改账号密码，或用 `sudo 1pctl update {port|username|password}` 命令调整']
+          if (not one_panel_pctl.stat.exists) else []
+        )
+      }) }}

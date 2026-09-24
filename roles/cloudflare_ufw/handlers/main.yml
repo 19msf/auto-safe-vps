@@ -1,0 +1,10 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart cf-ufw-sync timer
+  ansible.builtin.systemd:
+    name: cf-ufw-sync.timer
+    state: restarted
+    enabled: true

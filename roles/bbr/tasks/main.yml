@@ -1,0 +1,49 @@
+---
+# bbr：先检测，已开启则跳过；不强行覆盖主机自带的三网优化 sysctl
+- name: 检测当前 TCP 拥塞控制算法
+  ansible.builtin.command: sysctl -n net.ipv4.tcp_congestion_control
+  register: bbr_cc_now
+  changed_when: false
+
+- name: 检测当前默认 qdisc
+  ansible.builtin.command: sysctl -n net.core.default_qdisc
+  register: bbr_qdisc_now
+  changed_when: false
+
+- name: 判断是否已经是 BBR
+  ansible.builtin.set_fact:
+    bbr_already_on: "{{ (bbr_cc_now.stdout | trim) == 'bbr' }}"
+
+- name: 已开启 BBR，跳过任何修改
+  ansible.builtin.debug:
+    msg: "BBR 已开启（cc={{ bbr_cc_now.stdout | trim }}, qdisc={{ bbr_qdisc_now.stdout | trim }}），不再变更"
+  when: bbr_already_on
+
+- name: 设置 BBR 拥塞控制（仅当未启用）
+  ansible.posix.sysctl:
+    name: net.ipv4.tcp_congestion_control
+    value: bbr
+    state: present
+    sysctl_set: true
+    reload: true
+  when: not bbr_already_on
+
+- name: 设置默认队列管理器为 fq（仅当未启用 BBR 时；避免动主机自带优化）
+  ansible.posix.sysctl:
+    name: net.core.default_qdisc
+    value: fq
+    state: present
+    sysctl_set: true
+    reload: true
+  when: not bbr_already_on
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          ('BBR 已是开启状态（' ~ (bbr_cc_now.stdout | trim) ~ ' / ' ~ (bbr_qdisc_now.stdout | trim) ~ '），未做修改')
+          if bbr_already_on else
+          ('BBR 已启用：tcp_congestion_control=bbr, default_qdisc=fq')
+        ]
+      }) }}

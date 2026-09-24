@@ -1,0 +1,111 @@
+---
+# common：基础包安装
+- name: 更新 apt 索引
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: 安装基础工具
+  ansible.builtin.apt:
+    name:
+      - sudo
+      - curl
+      - wget
+      - vim
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - software-properties-common
+      - python3
+      - python3-pip
+      - rsync
+      - htop
+      - jq
+      - net-tools
+      - dnsutils
+    state: present
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: "{{ host_report | combine({'actions': host_report.actions + ['基础工具已安装']}) }}"
+
+# ---------- 基础环境：Docker / Docker Compose ----------
+# 任何依赖容器的角色（safeline_waf 等）都靠这里保底；幂等，已装则跳过。
+- name: 判断本次是否需要 Docker
+  ansible.builtin.set_fact:
+    common_docker_required: >-
+      {{ (safeline_waf.enabled | default(false))
+         or (one_panel.enabled | default(false)) }}
+
+- name: 检测 docker
+  ansible.builtin.command: docker --version
+  register: common_docker_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: common_docker_required | bool
+
+- name: 安装 Docker（官方一键脚本，仅未安装时执行）
+  ansible.builtin.shell: |
+    set -eo pipefail
+    curl -fsSL https://get.docker.com | bash
+  args:
+    executable: /bin/bash
+  when:
+    - common_docker_required | bool
+    - common_docker_check.rc | default(1) != 0
+  changed_when: true
+
+- name: 确保 docker 服务已启用并启动
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+  when: common_docker_required | bool
+
+- name: 检测 docker compose v2 插件
+  ansible.builtin.command: docker compose version --short
+  register: common_compose_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: common_docker_required | bool
+
+- name: 安装 docker-compose-plugin（缺失时执行）
+  ansible.builtin.apt:
+    name: docker-compose-plugin
+    state: present
+    update_cache: true
+  when:
+    - common_docker_required | bool
+    - common_compose_check.rc | default(1) != 0
+
+- name: 复检 docker / docker compose 可用
+  ansible.builtin.shell: |
+    set -eo pipefail
+    docker --version
+    docker compose version --short
+  args:
+    executable: /bin/bash
+  register: common_docker_final
+  changed_when: false
+  when: common_docker_required | bool
+
+- name: 记录 Docker 状态到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          ('Docker 已存在，跳过安装' if (common_docker_check.rc | default(1)) == 0 else 'Docker 已自动安装') ~
+          '；Compose 已就绪'
+        ]
+      }) }}
+  when: common_docker_required | bool
+
+- name: 记录未启用容器模块  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + ['未启用容器模块，跳过 Docker 安装']
+      }) }}
+  when: not (common_docker_required | bool)

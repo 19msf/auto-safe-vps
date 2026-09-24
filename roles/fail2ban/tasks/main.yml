@@ -1,0 +1,35 @@
+---
+- name: 安装 fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+
+- name: 配置 jail.local
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: 安装自定义 webhook action（封禁/解封通知）
+  ansible.builtin.template:
+    src: action.d/autosafe-webhook.conf.j2
+    dest: /etc/fail2ban/action.d/autosafe-webhook.conf
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: 启用并启动 fail2ban
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          'fail2ban 已启用，maxretry=' ~ fail2ban.maxretry ~
+          ' bantime=' ~ fail2ban.bantime ~ 's，封禁会通过 webhook 通知'
+        ]
+      }) }}

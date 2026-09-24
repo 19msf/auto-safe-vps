@@ -1,0 +1,33 @@
+# =====================================================
+# Ansible Inventory 主机清单（示例）
+# 复制为 inventory.ini 后再填入真实信息：
+#   cp inventory.ini.example inventory.ini
+# =====================================================
+#
+# 列表写所有要执行加固脚本的 VPS。
+# ansible_host       —— 公网 IP 或域名
+# ansible_port       —— 当前生效的 SSH 端口
+#                       第 1/2 阶段：写 22（VPS 厂商默认）
+#                       第 3 阶段（跑完 ./run.sh --change-port）：改为 config.yml 里的 ssh.port（默认 2233）
+# ansible_user       —— 登录用户
+#                       第 1 阶段：root（接 root 密码）
+#                       第 2/3 阶段：admin_user.name（默认 deploy，已写公钥）
+# ansible_ssh_private_key_file —— 本地的 SSH 私钥
+# 如果首次还在用密码登录，可暂时填 ansible_ssh_pass=xxx 或加 -k 参数
+#
+# 部署阶段速查：
+#   阶段 1：root@22 + 密码（./run.sh -k --ask-become-pass，跑完整机加固）
+#   阶段 2：deploy@22 + 私钥（./run.sh，验证幂等）
+#   阶段 3：./run.sh --change-port 切端口；之后改 inventory 为 deploy@2233
+#
+# 注意：每台 VPS 的 hostname（[vps] 下方第一段）会作为标识在最终报告中输出。
+
+[vps]
+vps1 ansible_host=1.2.3.4   ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+vps2 ansible_host=5.6.7.8   ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+vps3 ansible_host=9.10.11.12 ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+
+[vps:vars]
+# 强制使用 sudo
+ansible_become=true
+ansible_become_method=sudo

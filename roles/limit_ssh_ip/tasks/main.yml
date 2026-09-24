@@ -1,0 +1,33 @@
+---
+# limit_ssh_ip：UFW 仅放行白名单 IP 到 SSH 端口（幂等）
+- name: 读取当前 UFW 规则
+  ansible.builtin.command: ufw status
+  register: limit_ssh_ip_ufw_status
+  changed_when: false
+
+- name: 删除"全开"的 SSH 规则（仅当存在时才删除，避免每次 changed）
+  community.general.ufw:
+    rule: allow
+    port: "{{ effective_ssh_port }}"
+    proto: tcp
+    delete: true
+  when: limit_ssh_ip_ufw_status.stdout is search('(?m)^' ~ effective_ssh_port ~ '/tcp\s+ALLOW\s+Anywhere')
+
+- name: 仅允许白名单 IP 访问 SSH（ufw 模块本身幂等）
+  community.general.ufw:
+    rule: allow
+    src: "{{ item }}"
+    port: "{{ effective_ssh_port }}"
+    proto: tcp
+    comment: "SSH whitelist"
+  loop: "{{ ssh.allowed_ips }}"
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          'SSH 限定登录 IP（端口 ' ~ effective_ssh_port ~ '）：' ~ (ssh.allowed_ips | join(', '))
+        ],
+        'warnings': host_report.warnings + ['若白名单 IP 写错，可能锁死自己；请通过 VPS 厂商控制台修复']
+      }) }}

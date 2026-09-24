@@ -1,0 +1,148 @@
+---
+# =====================================================
+# 主 Playbook：一键 VPS 安全加固
+# 用法： ./run.sh   或   ansible-playbook -i inventory.ini site.yml
+# =====================================================
+- name: VPS 基础安全加固
+  hosts: vps
+  gather_facts: true
+  vars_files:
+    - config.yml
+  pre_tasks:
+    - name: 确保 OS 是 Debian 系（Ubuntu/Debian）
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'Debian'
+        fail_msg: "本剧本仅支持 Ubuntu/Debian，当前系统：{{ ansible_facts['distribution'] }}"
+      tags: always
+
+    - name: 校验必填配置项
+      ansible.builtin.assert:
+        that:
+          - admin_user.name | default('') | length > 0
+          - admin_user.name != 'root'
+          - admin_user.name is match('^[a-z_][a-z0-9_-]*[$]?$')
+          - admin_user.password | default('') | length >= 8
+        fail_msg: |
+          [配置错误] 请在 config.yml 中填写：
+            admin_user.name      （合法的非 root Linux 用户名）
+            admin_user.password  （管理员密码，>= 8 位；建议 16 位以上）
+        success_msg: "管理员账号配置 OK"
+      tags: always
+
+    - name: 校验登录通知配置（启用时 webhook_url 必填且不能是占位符）
+      ansible.builtin.assert:
+        that:
+          - login_notify.webhook_url | default('') | length > 0
+          - "'REPLACE_WITH_YOUR_TOKEN' not in (login_notify.webhook_url | default(''))"
+        fail_msg: |
+          [配置错误] login_notify.enabled=true 但 webhook_url 缺失或仍是占位符。
+          请在 config.yml 的 login_notify.webhook_url 填入真实地址；
+          飞书示例：https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>
+          或将 login_notify.enabled 设为 false 关闭此功能。
+      when: login_notify.enabled | default(true)
+      tags: always
+
+    - name: 初始化报告数据结构
+      ansible.builtin.set_fact:
+        host_report:
+          host: "{{ inventory_hostname }}"
+          public_ip: "{{ ansible_host }}"
+          actions: []
+          access_points: []
+          credentials: []
+          warnings: []
+      tags: always
+
+    - name: 计算当前 SSH 实际生效端口（UFW / fail2ban / limit_ssh_ip 都按这个端口工作）
+      ansible.builtin.set_fact:
+        effective_ssh_port: "{{ ansible_port | default(22) | int }}"
+      tags: always
+
+    - name: 校验 honeypot 与 SSH 不能用同一个端口
+      ansible.builtin.assert:
+        that:
+          - (honeypot.port | int) != (effective_ssh_port | int)
+        fail_msg: |
+          [配置错误] honeypot.port={{ honeypot.port }} 与当前 SSH 端口 {{ effective_ssh_port }} 冲突。
+          - SSH 还在 22 时（首次部署），请把 honeypot.enabled 改 false 或改 honeypot 端口
+          - 跑完 change_port.yml + inventory 改成 ansible_port=2233 后，honeypot 才能用 22
+      when: honeypot.enabled | default(false)
+      tags: always
+
+  roles:
+    - role: common
+      tags: [common, always]
+    - role: notify
+      when: login_notify.enabled | default(true)
+      tags: [notify, always]
+    - role: user
+      tags: [user]
+    - role: ssh_hardening
+      tags: [ssh]
+    - role: fail2ban
+      when: fail2ban.enabled | default(true)
+      tags: [fail2ban]
+    - role: ufw
+      when: ufw.enabled | default(true)
+      tags: [ufw]
+    - role: cloudflare_ufw
+      when: cloudflare_ufw.enabled | default(false)
+      tags: [cloudflare_ufw, cf]
+    - role: limit_ssh_ip
+      when: ssh.allowed_ips | default([]) | length > 0
+      tags: [limit_ssh_ip, allowed_ips]
+    - role: honeypot
+      when: honeypot.enabled | default(false)
+      tags: [honeypot]
+    - role: login_notify
+      when: login_notify.enabled | default(true)
+      tags: [login_notify]
+    - role: unattended_upgrades
+      when: unattended_upgrades.enabled | default(true)
+      tags: [updates]
+    - role: bbr
+      when: bbr.enabled | default(true)
+      tags: [bbr]
+    - role: safeline_waf
+      when: safeline_waf.enabled | default(false)
+      tags: [waf, safeline]
+    - role: one_panel
+      when: one_panel.enabled | default(false)
+      tags: ["1panel", panel]
+    - role: ssl_template
+      when: ssl_template.enabled | default(false)
+      tags: [ssl]
+    - role: wireguard_placeholder
+      when: wireguard.enabled | default(false)
+      tags: [wireguard]
+    - role: report
+      tags: [report, always]
+
+# 在控制机汇总输出最终报告
+- name: 汇总报告写入本地
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - config.yml
+  tasks:
+    - name: 创建报告目录
+      ansible.builtin.file:
+        path: "{{ report.output_dir | default('./reports') }}"
+        state: directory
+        mode: "0755"
+      tags: always
+
+    - name: 渲染汇总报告
+      ansible.builtin.template:
+        src: templates/summary_report.md.j2
+        dest: "{{ report.output_dir | default('./reports') }}/summary-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}.md"
+        mode: "0644"
+      vars:
+        all_reports: "{{ groups['vps'] | map('extract', hostvars, 'host_report') | list }}"
+      tags: always
+
+    - name: 输出报告路径
+      ansible.builtin.debug:
+        msg: "报告已生成，请查看 {{ report.output_dir | default('./reports') }} 目录下最新的 summary-*.md"
+      tags: always

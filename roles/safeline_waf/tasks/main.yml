@@ -1,0 +1,193 @@
+---
+# safeline_waf：长亭雷池 WAF（Docker 一键部署，幂等）
+#
+# 关键约定：
+#   - Docker 由独立的 `common`/`docker` role 在 site.yml 中预先装好。
+#   - 雷池 setup.sh 装完会调 `mgt-cli reset-admin --once` 生成**随机**账号密码并打印
+#     （格式：[INFO] Initial username：admin / [INFO] Initial password：xxxxxxxx）。
+#     早期版本支持 `resetadmin --username/--password` 同步成 config 里的值，但行为
+#     与版本强耦合，新老不同步、容易踩坑。这里**接受随机密码**，从安装日志里解析后
+#     写进最终报告——和 1Panel 同一套思路，简单可靠。
+#   - 想改账号 / 密码：登录控制台手动改，或在 VPS 上跑：
+#       sudo docker exec safeline-mgt resetadmin              # 重置随机密码
+#       sudo docker exec safeline-mgt resetadmin --username U --password P  # 新版才支持
+#       （老版本可能没有 --username/--password 参数；docker exec 后跟 --help 自查）
+
+- name: 检测雷池是否已安装
+  ansible.builtin.stat:
+    path: /data/safeline/compose.yaml
+  register: safeline_waf_marker
+
+- name: 清理上次安装失败留下的残骸（仅当未真正装成功时）
+  # marker 是 /data/safeline/compose.yaml；它不存在但 /data/safeline 还在 = 上次失败
+  # 残留目录会让 setup.sh 的 validate_directory 死循环。
+  ansible.builtin.file:
+    path: /data/safeline
+    state: absent
+  when: not safeline_waf_marker.stat.exists
+
+- name: 下载雷池安装脚本到本地
+  ansible.builtin.get_url:
+    url: https://waf-ce.chaitin.cn/release/latest/setup.sh
+    dest: /tmp/safeline-setup.sh
+    mode: "0755"
+    validate_certs: true
+  when: not safeline_waf_marker.stat.exists
+
+- name: 若未安装则一键安装雷池 WAF（修补所有交互函数）
+  # setup.sh 里有两个交互函数会卡死非交互执行：
+  #   1) confirm()           —— `read -n 1 -s` 单字符读取，stdin 是 pipe 时立刻返回空，
+  #                              进入 *) 递归分支死循环
+  #   2) validate_directory() —— `read input_path` 读目录路径，stdin 关闭时永远空字符串，
+  #                              目录已存在则 while true 死循环
+  # 用 Python 修补：
+  #   - confirm()           → 直接 return 1（拒绝所有 Y/n 提问，对应：不关 ufw / firewalld / SELinux）
+  #   - validate_directory() → 直接用默认 SAFELINE_PATH，不读输入、不再问 confirm
+  # 雷池跑在 Docker，9443 控制台端口由后续 ufw 任务显式放行。
+  ansible.builtin.shell: |
+    set -eo pipefail
+    python3 - <<'PYEOF'
+    import re, sys
+    p = '/tmp/safeline-setup.sh'
+    with open(p) as f:
+        src = f.read()
+
+    new_confirm = (
+        'confirm() {\n'
+        '    echo -e "\\033[34m[SafeLine] $* \\033[1;36m(auto-decline by ansible)\\033[0m"\n'
+        '    return 1\n'
+        '}'
+    )
+    src, n1 = re.subn(
+        r'^confirm\(\) \{\n.*?\n\}',
+        new_confirm,
+        src,
+        count=1,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if n1 != 1:
+        sys.stderr.write('ERROR: confirm() not found\n')
+        sys.exit(2)
+
+    new_validate = (
+        'validate_directory() {\n'
+        '    echo "[SafeLine] (auto) install dir = $SAFELINE_PATH"\n'
+        '    mkdir -p "$SAFELINE_PATH" || abort "创建安装目录失败"\n'
+        '}'
+    )
+    src, n2 = re.subn(
+        r'^validate_directory\(\) \{\n.*?\n\}',
+        new_validate,
+        src,
+        count=1,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if n2 != 1:
+        sys.stderr.write('ERROR: validate_directory() not found\n')
+        sys.exit(3)
+
+    if 'read -n 1 -s opt' in src:
+        sys.stderr.write('ERROR: original confirm read still present\n')
+        sys.exit(4)
+    if 'read input_path' in src:
+        sys.stderr.write('ERROR: original validate_directory read still present\n')
+        sys.exit(5)
+
+    with open(p, 'w') as f:
+        f.write(src)
+    print('patched: confirm() -> return 1, validate_directory() -> auto-accept default')
+    PYEOF
+    # 输出同时打到日志，VPS 上 `tail -f /tmp/safeline-install.log` 看实时进度
+    RELEASE="{{ safeline_waf.release | default('latest') }}" \
+      bash /tmp/safeline-setup.sh < /dev/null 2>&1 | tee /tmp/safeline-install.log
+    exit ${PIPESTATUS[0]}
+  args:
+    executable: /bin/bash
+  when: not safeline_waf_marker.stat.exists
+  register: safeline_waf_install
+  changed_when: true
+
+- name: 清理安装脚本
+  ansible.builtin.file:
+    path: /tmp/safeline-setup.sh
+    state: absent
+  when: not safeline_waf_marker.stat.exists
+
+- name: 等待 safeline-mgt 容器就绪
+  ansible.builtin.shell: |
+    set -eo pipefail
+    for i in $(seq 1 30); do
+      docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | grep -q '^safeline-mgt$' && exit 0
+      sleep 2
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: 从安装日志解析雷池随机账号密码（仅首次安装；已存在时跳过）
+  # setup.sh 安装末尾会调 mgt-cli reset-admin --once 输出：
+  #   [INFO] Initial username：admin
+  #   [INFO] Initial password：xxxxxxxx
+  # 中文冒号「：」和英文冒号「:」都得兼容（不同版本可能不同）。
+  ansible.builtin.shell: |
+    set -eo pipefail
+    grep -aE 'Initial (username|password)' /tmp/safeline-install.log || true
+  args:
+    executable: /bin/bash
+  register: safeline_waf_creds_raw
+  changed_when: false
+  when: not safeline_waf_marker.stat.exists
+  no_log: true
+
+- name: 解析账号密码
+  ansible.builtin.set_fact:
+    safeline_waf_real_user: "{{ safeline_waf_creds_raw.stdout
+      | default('')
+      | regex_search('Initial username[：:]\\s*(\\S+)', '\\1')
+      | first | default('') }}"
+    safeline_waf_real_password: "{{ safeline_waf_creds_raw.stdout
+      | default('')
+      | regex_search('Initial password[：:]\\s*(\\S+)', '\\1')
+      | first | default('') }}"
+  when: not safeline_waf_marker.stat.exists
+  no_log: true
+
+- name: 放行雷池端口
+  community.general.ufw:
+    rule: allow
+    port: "{{ safeline_waf.console_port | default(9443) }}"
+    proto: tcp
+    comment: "Safeline WAF console"
+  when: ufw.enabled | default(true)
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: >-
+      {{ host_report | combine({
+        'actions': host_report.actions + [
+          ('雷池 WAF 已存在，未变更账号密码') if safeline_waf_marker.stat.exists
+          else ('雷池 WAF 已安装；账号密码由 setup.sh 随机生成，请尽快登录后修改')
+        ],
+        'access_points': host_report.access_points + [{
+          'name': '雷池 WAF 控制台',
+          'address': 'https://' ~ ansible_host ~ ':' ~ (safeline_waf.console_port | default(9443))
+        }],
+        'credentials': host_report.credentials + (
+          [
+            {'item': '雷池账号',
+             'value': (safeline_waf_real_user | default(''))
+                      if (safeline_waf_real_user | default('')) | length > 0
+                      else '解析失败，请上 VPS 跑 sudo docker exec safeline-mgt resetadmin'},
+            {'item': '雷池密码',
+             'value': (safeline_waf_real_password | default(''))
+                      if (safeline_waf_real_password | default('')) | length > 0
+                      else '解析失败，请上 VPS 跑 sudo docker exec safeline-mgt resetadmin'}
+          ] if (not safeline_waf_marker.stat.exists)
+            else [{'item': '雷池账号 / 密码', 'value': '已存在，请保留之前的账号密码'}]
+        ),
+        'warnings': host_report.warnings + (
+          ['雷池 WAF 账号密码由 setup.sh 随机生成；强烈建议登录控制台后修改密码（或运行 sudo docker exec safeline-mgt resetadmin 重置）']
+          if (not safeline_waf_marker.stat.exists) else []
+        )
+      }) }}

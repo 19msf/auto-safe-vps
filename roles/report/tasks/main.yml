@@ -1,0 +1,5 @@
+---
+# report：把每台机器的 host_report 汇总到 hostvars，最终在 site.yml 第二个 play 渲染
+- name: 把单机报告标记完成
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} 加固完成，汇总报告将由控制端渲染。"

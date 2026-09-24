@@ -1,0 +1,29 @@
+---
+# login_notify：注册 PAM 钩子，调用通用 /opt/scripts/notify.sh
+- name: 写入 PAM 钩子脚本（薄包装）
+  ansible.builtin.copy:
+    dest: /opt/scripts/login_notify.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # SSH 登录通知 → 调用通用 notify.sh
+      [ "$PAM_TYPE" != "{{ login_notify.pam_type | default('open_session') }}" ] && exit 0
+      {% if not (login_notify.events.ssh_login | default(true)) %}exit 0{% endif %}
+
+      time_str=$(date +"%Y-%m-%d %H:%M:%S")
+      /opt/scripts/notify.sh ssh_login "🖥️ SSH 登录" \
+        "用户=${PAM_USER}" \
+        "来源IP=${PAM_RHOST}" \
+        "时间=${time_str}"
+      exit 0
+
+- name: 添加 PAM 钩子（lineinfile 幂等）
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/sshd
+    line: "session optional pam_exec.so /opt/scripts/login_notify.sh"
+    regexp: '^session\s+optional\s+pam_exec\.so\s+/opt/scripts/login_notify\.sh'
+    state: present
+
+- name: 记录到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: "{{ host_report | combine({'actions': host_report.actions + ['SSH 登录通知（webhook）已配置']}) }}"

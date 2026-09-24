@@ -1,0 +1,10 @@
+---
+# WireGuard：占位 role，当前不自动部署
+# 详见 docs/TODO.md 中的设计权衡
+- name: WireGuard 占位提示
+  ansible.builtin.debug:
+    msg: "WireGuard 暂未自动化，请参考 docs/TODO.md 手工配置"
+
+- name: 记录 TODO 到报告  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    host_report: "{{ host_report | combine({'warnings': host_report.warnings + ['WireGuard 暂未自动化（详见 docs/TODO.md）']}) }}"
