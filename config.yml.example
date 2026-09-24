@@ -72,15 +72,20 @@ ufw:
     # - { port: 8080, proto: tcp, comment: "old service",   state: "absent"  }
   disable_ping: true                   # 禁止 ICMP（ping）
 
-# ----------- 5. 蜜罐（伪装的旧 SSH 端口 22） -----------
+# ----------- 5. HFish 蜜罐（管理后台 + 伪装 SSH 22） -----------
 # 注意：honeypot.port 不能与当前 SSH 端口（inventory 的 ansible_port）冲突。
 # 推荐流程：第一次部署保持 false；跑完 ./run.sh --change-port 切到新端口、改完 inventory 后再开启。
 honeypot:
   enabled: false                       # 第一次部署保持 false；切完 SSH 端口后再改 true
-  port: 22                             # 监听 22，所有连接立即记录并拒绝
-  log_path: /var/log/ssh-honeypot.log
+  port: 22                             # HFish 内置 SSH 蜜罐端口
+  management_port: 4433                # HTTPS 管理页面，实际路径为 /web/
+  node_port: 4434                      # 节点回传端口，单机部署不对公网放行
+  management_allowed_ips: []          # 空=公网可访问；建议改为 ["1.2.3.4"]
+  image: "threatbook/hfish-server:3.3.6"
+  data_dir: "/usr/share/hfish"
+  timezone: "Asia/Shanghai"
 
-# ----------- 6. 通知（PAM + Fail2ban + 蜜罐 共用同一个 webhook）-----------
+# ----------- 6. 通知（PAM + Fail2ban 共用 webhook；HFish 告警在其后台配置）-----------
 # 默认开启。如需关闭，把 enabled 设为 false。
 # 任何接收 JSON POST 的 webhook 都可以（企业微信 / 飞书 / Slack / 自建）。
 login_notify:
@@ -103,9 +108,6 @@ login_notify:
     ssh_login: true                    # SSH 登录成功
     fail2ban_ban: true                 # fail2ban 封禁某 IP
     fail2ban_unban: false              # fail2ban 解封某 IP
-    honeypot_hit: true                 # 蜜罐被探测/连接
-  # 蜜罐通知防刷：N 秒内同一 IP 只通知一次
-  honeypot_throttle_seconds: 60
 
 # ----------- 7. 自动安全更新 -----------
 unattended_upgrades:
@@ -147,15 +149,17 @@ cloudflare_ufw:
 #   sudo docker exec safeline-mgt resetadmin --help                             # 自查参数
 safeline_waf:
   enabled: false                        # 基础加固默认不额外部署管理面板，按需开启
-  console_port: 9443                   # 控制台端口（ufw 会按这个端口放行）
+  console_port: 9443                   # 预期端口；运行时会以 Docker 实际映射为准
   release: "lts"                       # latest / lts
   # 以下字段已废弃；保留只为向后兼容（不再读取）。
   # admin_user: "admin"
   # admin_password: "..."
 
 # ----------- 11. 1Panel 面板 -----------
-# 注意：1Panel v2 官方 install.sh 不支持任何静默 / 参数化安装（这是上游设计，
-# 不是本剧本的限制）。安装时端口 / 入口 / 账号 / 密码全部由 install.sh 随机生成。
+# 使用 1Panel 官方 v2 在线入口，每次全新安装都会获取当前最新稳定版。
+# 官方已支持非交互安装；下面的端口 / 入口 / 账号 / 密码均可选：
+#   - 不填写：由官方安装脚本生成安全默认值，并在报告中记录
+#   - 填写：按官方参数固定安装（密码建议使用 Ansible Vault 管理）
 # 本剧本会：
 #   1) 装完后用 `1pctl user-info` 解析真实端口 / 入口 / 账号 / 密码
 #   2) 把真实端口加进 ufw 放行
@@ -167,12 +171,13 @@ safeline_waf:
 #   （改 entrance 安全入口需在控制台 → 面板设置 → 安全入口）
 one_panel:
   enabled: false                        # 基础加固默认不额外部署管理面板，按需开启
-  # 注意：以下字段已废弃（v2 不支持参数化安装），保留只为向后兼容；
-  # 改值不会生效，请按上面的提示登录控制台或用 1pctl 命令调整。
-  # custom_port: "8888"
-  # custom_entrance: "secret"
-  # custom_username: "admin"
-  # custom_password: "..."
+  install_url: "https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh"
+  lang: "zh"
+  install_dir: "/opt"
+  # port: 18080                       # 1-65535；留空则由官方脚本生成
+  # entrance: "panelEntrance"        # 3-30 位字母、数字、下划线
+  # username: "panelAdmin"           # 3-30 位字母、数字、下划线
+  # password: "ChangeMe_123456"      # 8-30 位；生产环境请勿使用示例值
 
 # ----------- 12. SSL 证书模板（防 IP 泄露） -----------
 ssl_template:

@@ -15,11 +15,12 @@
 
 - name: 检测雷池是否已安装
   ansible.builtin.stat:
-    path: /data/safeline/compose.yaml
+    path: /data/safeline/docker-compose.yaml
   register: safeline_waf_marker
 
 - name: 清理上次安装失败留下的残骸（仅当未真正装成功时）
-  # marker 是 /data/safeline/compose.yaml；它不存在但 /data/safeline 还在 = 上次失败
+  # marker 是官方安装脚本生成的 /data/safeline/docker-compose.yaml；
+  # 它不存在但 /data/safeline 还在 = 上次失败留下的残骸。
   # 残留目录会让 setup.sh 的 validate_directory 死循环。
   ansible.builtin.file:
     path: /data/safeline
@@ -132,13 +133,39 @@
   # 中文冒号「：」和英文冒号「:」都得兼容（不同版本可能不同）。
   ansible.builtin.shell: |
     set -eo pipefail
-    grep -aE 'Initial (username|password)' /tmp/safeline-install.log || true
+    # 上游安装器会输出 ANSI 颜色码（例如 ESC[0m）；先清理，避免控制字符进入凭据和报告。
+    grep -aE 'Initial (username|password)' /tmp/safeline-install.log \
+      | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' \
+      || true
   args:
     executable: /bin/bash
   register: safeline_waf_creds_raw
   changed_when: false
   when: not safeline_waf_marker.stat.exists
   no_log: true
+
+- name: 读取雷池控制台实际映射端口
+  ansible.builtin.command:
+    argv:
+      - docker
+      - port
+      - safeline-mgt
+      - 1443/tcp
+  register: safeline_waf_console_port_raw
+  changed_when: false
+
+- name: 解析雷池控制台实际端口
+  ansible.builtin.set_fact:
+    safeline_waf_real_console_port: "{{ safeline_waf_console_port_raw.stdout
+      | regex_search(':(\\d+)\\s*$', '\\1')
+      | first | default('') }}"
+
+- name: 校验雷池控制台实际端口
+  ansible.builtin.assert:
+    that:
+      - safeline_waf_real_console_port | length > 0
+      - (safeline_waf_real_console_port | regex_search('^[0-9]+$')) is not none
+    fail_msg: "无法从 safeline-mgt 容器读取 1443/tcp 的主机映射端口。"
 
 - name: 解析账号密码
   ansible.builtin.set_fact:
@@ -153,13 +180,32 @@
   when: not safeline_waf_marker.stat.exists
   no_log: true
 
+- name: 校验雷池凭据不含控制字符
+  ansible.builtin.assert:
+    that:
+      - (safeline_waf_real_user | default('') | regex_search('[\\x00-\\x1f\\x7f]')) is none
+      - (safeline_waf_real_password | default('') | regex_search('[\\x00-\\x1f\\x7f]')) is none
+    fail_msg: "雷池安装日志中的账号或密码包含控制字符，已中止写入报告。"
+  when: not safeline_waf_marker.stat.exists
+  no_log: true
+
 - name: 放行雷池端口
+  community.general.ufw:
+    rule: allow
+    port: "{{ safeline_waf_real_console_port }}"
+    proto: tcp
+    comment: "Safeline WAF console"
+  when: ufw.enabled | default(true)
+
+- name: 删除与实际映射不符的旧雷池端口规则
   community.general.ufw:
     rule: allow
     port: "{{ safeline_waf.console_port | default(9443) }}"
     proto: tcp
-    comment: "Safeline WAF console"
-  when: ufw.enabled | default(true)
+    delete: true
+  when:
+    - ufw.enabled | default(true)
+    - (safeline_waf.console_port | default(9443) | string) != (safeline_waf_real_console_port | string)
 
 - name: 记录到报告  # noqa: var-naming[no-role-prefix]
   ansible.builtin.set_fact:
@@ -171,7 +217,7 @@
         ],
         'access_points': host_report.access_points + [{
           'name': '雷池 WAF 控制台',
-          'address': 'https://' ~ ansible_host ~ ':' ~ (safeline_waf.console_port | default(9443))
+          'address': 'https://' ~ ansible_host ~ ':' ~ safeline_waf_real_console_port
         }],
         'credentials': host_report.credentials + (
           [

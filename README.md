@@ -12,12 +12,12 @@
 | Fail2ban | ✅ | maxretry/bantime 可配；**封禁/解封通过 webhook 通知**（与登录同一渠道） |
 | UFW 防火墙 + 禁 ping | ✅ | |
 | **限定 SSH 登录 IP（白名单）** | ✅ | 在 `config.yml` 的 `ssh.allowed_ips` 里配置；最终报告中体现；可单独跑 `-t allowed_ips` 增量更新 |
-| **蜜罐**（22 端口监听 + 记录） | ✅ | socat + systemd unit，日志 `/var/log/ssh-honeypot.log`；**命中通过 webhook 通知**（节流防刷） |
+| **HFish 蜜罐** | ✅ | Docker 部署；SSH 蜜罐使用 22，带中文 Web 管理台、攻击记录和告警配置 |
 | 登录通知（webhook） | ✅（默认开启） | PAM + 企业微信 / 飞书 / Slack / 通用 JSON；webhook 在 config.yml 里填 |
 | 自动安全更新 | ✅ | unattended-upgrades |
 | BBR | ✅ | 如果已经开启了BBR，不再做额外 sysctl |
 | **长亭雷池 WAF** | ✅ | 可选；Docker 一键部署，随机账号密码 / 控制台地址写入报告 |
-| **1Panel** | ✅ | 可选；非交互安装，端口/入口/账号/密码由上游随机生成并写入报告 |
+| **1Panel** | ✅ | 可选；使用官方 v2 在线入口安装最新稳定版，支持非交互参数，真实访问信息写入报告 |
 | **SSL 防 IP 泄露**（nginx 模板） | ⚠️ 半自动 | 生成 `ssl_reject_handshake` 模板 + acme.sh，但 **不会自动 reload nginx**（避免覆盖现网） |
 | WireGuard | ❌ TODO | 见 `docs/TODO.md` 设计权衡 |
 | **Cloudflare UFW 锁源** | ✅ | 可选；80/443 仅允许 Cloudflare 官方 IP，并由 systemd timer 定期同步 |
@@ -101,7 +101,7 @@ T6  ./run.sh                              ← 阶段 2：用 deploy 重跑一遍
 T7  ./run.sh --change-port --ask-become-pass  ← 阶段 3：切端口（-K 兜底，免密时被忽略）
 T8  另一个终端验证：ssh -p 2233 deploy@<VPS_IP>
 T9  改 inventory：ansible_port=2233       UFW 已在 T7 即时放行新端口；22 永远不删（给蜜罐留的）
-T10 honeypot 想用 22：把 honeypot.enabled 改 true，./run.sh -t ufw,honeypot
+T10 HFish 想用 22：把 honeypot.enabled 改 true，./run.sh -t ufw,hfish
 ```
 
 #### 关键决策
@@ -135,7 +135,7 @@ T10 honeypot 想用 22：把 honeypot.enabled 改 true，./run.sh -t ufw,honeypo
 | **切换 SSH 端口**（独立 playbook） | `./run.sh --change-port --ask-become-pass`，跑完手改 inventory 的 ansible_port |
 | 只装 / 重配 fail2ban | `./run.sh -t fail2ban` |
 | 只调整 UFW | `./run.sh -t ufw` |
-| 只装 / 重启蜜罐 | `./run.sh -t honeypot` |
+| 只装 / 检查 HFish 蜜罐 | `./run.sh -t hfish` |
 | 只刷新登录通知 | `./run.sh -t login_notify` |
 | 只装 1Panel | `./run.sh -t 1panel` |
 | 只装雷池 WAF | `./run.sh -t waf` |
@@ -150,21 +150,42 @@ T10 honeypot 想用 22：把 honeypot.enabled 改 true，./run.sh -t ufw,honeypo
 - 已执行的安全操作
 - SSH 新端口、管理员账号 / 初始密码
 - 雷池 WAF 控制台地址 + 安装脚本随机生成的初始账号密码（仅首次安装可从日志解析）
-- 1Panel 入口地址 + 账号 + 密码 + 端口（**全部由 1Panel 安装脚本随机生成**——v2 上游不支持静默自定义安装；强烈建议登录后立即在控制台修改账号密码）
+- 1Panel 入口地址 + 账号 + 密码 + 端口（未在配置中指定的字段由官方安装脚本生成）
+- HFish 管理台地址与首次默认凭据（登录后必须立即修改）
 - SSH 白名单
 - 待手动处理的项（SSL / WireGuard）
 
 ## 安全提示
 
 - 报告里 SSH 管理员密码仅以“见 config.yml”占位呈现，不回显明文；雷池和 1Panel 的随机初始凭据会写入首次安装报告。
-- **1Panel 是例外**：v2 上游不支持静默自定义安装，端口 / 入口 / 账号 / 密码全部由 install.sh 随机生成，剧本会从 `1pctl user-info` 抓取真实值**完整写到报告里**——这是设计妥协，请妥善保管报告，并在登录后立即修改账号密码（见下方 1Panel 运维段）。
+- 1Panel 使用官方 v2 非交互安装接口。端口、入口、账号和密码可以在 `config.yml` 中指定；未指定时使用官方脚本生成值，剧本会从 `1pctl user-info` 抓取真实信息写入报告。
 - `config.yml` / `inventory.ini` 已在 `.gitignore`；建议加密保存（git-crypt / sops / age）。
 - 修改 SSH 端口是**独立的 playbook**（`./run.sh --change-port --ask-become-pass`），不会被默认 `./run.sh` 自动触发。改完保留旧终端，新终端用新端口验证后再断开。`-K` 是兜底，deploy 账号已 NOPASSWD sudo 时会被忽略。
 - `inventory.ini` / `config.yml` / `reports/` 已在 `.gitignore`。
 
+## HFish 蜜罐运维
+
+HFish 使用官方 Docker 镜像部署，管理台地址为
+`https://<VPS_IP>:4433/web/`。首次默认账号为 `admin`、密码为
+`HFish2021`，登录后必须立即修改。
+
+- 真实 SSH 端口由 inventory 的 `ansible_port` 决定；HFish SSH 蜜罐默认使用 `22`。
+- 持久化数据位于 `/usr/share/hfish`，编排文件位于 `/opt/hfish/compose.yaml`。
+- `4434` 用于 HFish 节点回传；单机部署时 UFW 不向公网放行该端口。
+- `management_allowed_ips` 留空会公网放行管理台；建议首次登录后改成固定管理 IP 白名单。
+- HFish 自带邮件、Syslog、Webhook、企业微信、钉钉和飞书等告警，请在 HFish 管理台中配置。
+
+常用命令：
+
+```bash
+sudo docker ps --filter name=hfish
+sudo docker logs --tail 100 hfish
+sudo docker compose -f /opt/hfish/compose.yaml restart
+```
+
 ## 1Panel 面板运维
 
-1Panel v2 官方 install.sh 不支持静默 / 参数化安装，**首次装出来的端口、入口、账号、密码全部是随机的**。剧本已经做了三件事兜底：
+1Panel v2 官方安装脚本已经支持非交互参数。本项目使用官方最新在线入口；未在 `config.yml` 指定的端口、入口、账号和密码由安装脚本生成。剧本会：
 1. 装完后用 `1pctl user-info` 抓取真实端口 / 入口 / 账号 / 密码
 2. 把真实端口加进 ufw 放行
 3. 把以上信息**完整写进 `reports/summary-*.md`**
@@ -265,7 +286,7 @@ sudo docker exec safeline-mgt resetadmin
 3. 从日志 grep 出 `Initial username/password`，写到最终报告
 4. ufw 放行 9443（或 config 里的 `console_port`）
 
-**重跑 role 不会再改已存在的密码**——marker `/data/safeline/compose.yaml` 存在时所有安装/解析任务都被跳过。想改密码请用上面的命令或控制台。
+**重跑 role 不会再改已存在的密码**——marker `/data/safeline/docker-compose.yaml` 存在时所有安装/解析任务都被跳过。想改密码请用上面的命令或控制台。
 
 ## 目录结构
 ```

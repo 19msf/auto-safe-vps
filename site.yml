@@ -94,7 +94,7 @@
       tags: [limit_ssh_ip, allowed_ips]
     - role: honeypot
       when: honeypot.enabled | default(false)
-      tags: [honeypot]
+      tags: [honeypot, hfish]
     - role: login_notify
       when: login_notify.enabled | default(true)
       tags: [login_notify]

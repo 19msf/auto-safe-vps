@@ -109,6 +109,37 @@
         validate: "sshd -t -f %s"
       register: change_port_dropin
 
+    # sshd 允许同时声明多个 Port。若主配置或其他 drop-in 仍有 `Port 22`，
+    # 单纯新增 4399 会导致两个端口同时监听，22 蜜罐也会因此无法启动。
+    - name: 禁用主 sshd_config 中的显式端口
+      ansible.builtin.replace:
+        path: /etc/ssh/sshd_config
+        regexp: '^([ \t]*Port[ \t]+\d+.*)$'
+        replace: '# disabled by auto-safe-vps: \1'
+      register: change_port_main_ports
+
+    - name: 查找其他 SSH drop-in
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        patterns: "*.conf"
+        file_type: file
+      register: change_port_all_dropins
+
+    - name: 禁用其他 drop-in 中的显式端口
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^([ \t]*Port[ \t]+\d+.*)$'
+        replace: '# disabled by auto-safe-vps: \1'
+      loop: "{{ change_port_all_dropins.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: item.path != '/etc/ssh/sshd_config.d/98-autosafe-port.conf'
+      register: change_port_other_ports
+
+    - name: 校验完整 sshd 配置
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
     - name: 读取 sshd 实际生效的监听端口
       ansible.builtin.command: sshd -T -C user=root
       register: change_port_sshd_effective
@@ -131,6 +162,10 @@
         daemon_reload: true
       when: >-
         change_port_dropin.changed
+        or change_port_main_ports.changed
+        or (change_port_other_ports.results | default([])
+            | selectattr('changed', 'defined')
+            | selectattr('changed') | list | length > 0)
         or (ssh.port | string) not in change_port_current_ports
 
     - name: 等待新 SSH 端口监听就绪（在远端本地 wait，避免 ansible 切端口连不上）

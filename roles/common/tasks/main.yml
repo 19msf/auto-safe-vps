@@ -30,11 +30,12 @@
     host_report: "{{ host_report | combine({'actions': host_report.actions + ['基础工具已安装']}) }}"
 
 # ---------- 基础环境：Docker / Docker Compose ----------
-# 任何依赖容器的角色（safeline_waf 等）都靠这里保底；幂等，已装则跳过。
+# 任何依赖容器的角色（HFish / safeline_waf / 1Panel）都靠这里保底。
 - name: 判断本次是否需要 Docker
   ansible.builtin.set_fact:
     common_docker_required: >-
-      {{ (safeline_waf.enabled | default(false))
+      {{ (honeypot.enabled | default(false))
+         or (safeline_waf.enabled | default(false))
          or (one_panel.enabled | default(false)) }}
 
 - name: 检测 docker
