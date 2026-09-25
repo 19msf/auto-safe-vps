@@ -66,8 +66,6 @@ ufw:
     - { port: 80,   proto: tcp, comment: "HTTP",            state: "present" }
     - { port: 443,  proto: tcp, comment: "HTTPS",           state: "present" }
     # 雷池和 1Panel 会在启用后由各自 role 动态放行实际端口，不需要预先开放。
-    # 1Panel v2 使用随机端口，写死 8888 已无意义。
-    # - { port: 8888, proto: tcp, comment: "1Panel",          state: "present" }
     # 示例：要关掉某端口，把 state 改成 absent（无需删行，便于审计）
     # - { port: 8080, proto: tcp, comment: "old service",   state: "absent"  }
   disable_ping: true                   # 禁止 ICMP（ping）
@@ -151,9 +149,6 @@ safeline_waf:
   enabled: false                        # 基础加固默认不额外部署管理面板，按需开启
   console_port: 9443                   # 预期端口；运行时会以 Docker 实际映射为准
   release: "lts"                       # latest / lts
-  # 以下字段已废弃；保留只为向后兼容（不再读取）。
-  # admin_user: "admin"
-  # admin_password: "..."
 
 # ----------- 11. 1Panel 面板 -----------
 # 使用 1Panel 官方 v2 在线入口，每次全新安装都会获取当前最新稳定版。
