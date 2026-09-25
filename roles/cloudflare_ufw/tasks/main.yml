@@ -12,6 +12,7 @@
   ansible.builtin.apt:
     name: curl
     state: present
+    lock_timeout: 600
 
 - name: 确保 /opt/scripts 目录存在
   ansible.builtin.file:

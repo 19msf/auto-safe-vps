@@ -5,6 +5,7 @@
       - unattended-upgrades
       - apt-listchanges
     state: present
+    lock_timeout: 600
 
 - name: 启用自动安全更新配置
   ansible.builtin.copy:

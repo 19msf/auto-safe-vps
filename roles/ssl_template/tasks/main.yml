@@ -4,6 +4,7 @@
   ansible.builtin.apt:
     name: nginx
     state: present
+    lock_timeout: 600
 
 - name: 安装 acme.sh（如未安装）
   ansible.builtin.shell: |

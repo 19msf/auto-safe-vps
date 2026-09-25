@@ -3,6 +3,7 @@
   ansible.builtin.apt:
     name: ufw
     state: present
+    lock_timeout: 600
 
 - name: 默认拒绝入站
   community.general.ufw:

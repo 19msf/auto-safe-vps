@@ -4,6 +4,7 @@
   ansible.builtin.apt:
     update_cache: true
     cache_valid_time: 3600
+    lock_timeout: 600
 
 - name: 安装基础工具
   ansible.builtin.apt:
@@ -24,6 +25,7 @@
       - net-tools
       - dnsutils
     state: present
+    lock_timeout: 600
 
 - name: 记录到报告  # noqa: var-naming[no-role-prefix]
   ansible.builtin.set_fact:
@@ -77,6 +79,7 @@
     name: docker-compose-plugin
     state: present
     update_cache: true
+    lock_timeout: 600
   when:
     - common_docker_required | bool
     - common_compose_check.rc | default(1) != 0

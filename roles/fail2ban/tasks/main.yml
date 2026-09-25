@@ -3,6 +3,7 @@
   ansible.builtin.apt:
     name: fail2ban
     state: present
+    lock_timeout: 600
 
 - name: 配置 jail.local
   ansible.builtin.template:

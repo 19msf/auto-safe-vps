@@ -23,137 +23,305 @@
 | **Cloudflare UFW 锁源** | ✅ | 可选；80/443 仅允许 Cloudflare 官方 IP，并由 systemd timer 定期同步 |
 | Ubuntu Pro / 三网优化 | ❌ | 按需求不集成 |
 
-## 快速开始
+## 完整执行流程
 
-### 1. 准备控制端（Mac / Linux 任一即可）
+下面按首次接管一台全新 VPS 的顺序执行。多台 VPS 只需在 `inventory.ini` 中增加主机行。
 
-**macOS：**
+> 建议在自己的电脑、运维机或独立控制节点上运行 Ansible，不要在正在加固的 VPS 上直接控制自己。Windows 请使用 WSL；macOS 和 Linux 可以直接运行。整个过程中始终保留一个已登录的 VPS 终端，并准备好云厂商 VNC/救援控制台。
+
+### 1. 安装 Ansible 和依赖
+
+macOS：
+
 ```bash
 brew install ansible
 ```
 
-**Ubuntu / Debian：**
+Ubuntu / Debian / WSL：
+
 ```bash
-sudo apt update && sudo apt install -y ansible
-# 或者更新版（pipx 安装到当前用户）
-sudo apt install -y pipx && pipx install --include-deps ansible
+sudo apt update
+sudo apt install -y ansible git openssh-client
 ```
 
-**RHEL / CentOS / Rocky / Alma：**
+也可以使用较新的 pipx 版本：
+
 ```bash
-sudo dnf install -y epel-release && sudo dnf install -y ansible
+sudo apt install -y pipx
+pipx install --include-deps ansible
+pipx ensurepath
 ```
 
-**Arch：**
-```bash
-sudo pacman -S ansible
-```
+安装项目需要的 collection：
 
-**任意发行版（pip 通用）：**
-```bash
-python3 -m pip install --user ansible
-```
-
-装完后补上必要 collection：
 ```bash
 ansible-galaxy collection install community.general ansible.posix
+ansible-playbook --version
 ```
 
-### 2. 准备配置（真实文件不会被提交）
+### 2. 下载项目并准备执行权限
+
+```bash
+git clone https://github.com/19msf/auto-safe-vps.git
+cd auto-safe-vps
+chmod +x run.sh
+```
+
+如果脚本来自 Windows 并出现 `bash\r` 或 `bad interpreter`：
+
+```bash
+sed -i 's/\r$//' run.sh
+chmod +x run.sh
+```
+
+### 3. 准备 SSH 密钥
+
+先确认控制端是否已有密钥：
+
+```bash
+ls -l ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
+```
+
+如果没有，生成一对新的密钥：
+
+```bash
+ssh-keygen -t ed25519 -a 64 -f ~/.ssh/id_ed25519
+```
+
+- `~/.ssh/id_ed25519` 是私钥，只能保存在控制端。
+- `~/.ssh/id_ed25519.pub` 是公钥，可以写入服务器。
+
+推荐先把公钥放进 VPS 的 root 账号：
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@<VPS_IP>
+ssh -i ~/.ssh/id_ed25519 root@<VPS_IP>
+```
+
+如果云厂商镜像默认不允许 root，需在后面的 inventory 中填写实际初始用户，并确保该用户有 sudo 权限。
+
+### 4. 创建 inventory.ini 和 config.yml
+
 ```bash
 cp inventory.ini.example inventory.ini
-cp config.yml.example   config.yml
-vim inventory.ini   # 3 台 VPS 的 IP / 用户 / 私钥
-vim config.yml      # 管理员账号、密码、SSH 端口、白名单 IP、webhook 等
+cp config.yml.example config.yml
+chmod 600 inventory.ini config.yml
 ```
 
-> ⚠️ **必填项**：`admin_user.password`（>=8 位）、`login_notify.webhook_url`（如启用通知）。
-> 缺失时 `pre_tasks` 会立即报错，不会半路停下。
-> 当同时禁用 root 和密码登录时，目标管理员账号还必须至少有一把能被 `ssh-keygen` 验证的公钥，否则剧本会在应用 SSH 加固前安全中止。
+首次连接使用 root、公钥和默认 22 端口，`inventory.ini` 示例：
 
-### 3. 执行
+```ini
+[vps]
+vps1 ansible_host=<VPS_IP> ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+
+[vps:vars]
+ansible_become=true
+ansible_become_method=sudo
+```
+
+多台 VPS：
+
+```ini
+[vps]
+vps1 ansible_host=<VPS1_IP> ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+vps2 ansible_host=<VPS2_IP> ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+vps3 ansible_host=<VPS3_IP> ansible_port=22 ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+```
+
+编辑 `config.yml`，首次至少确认以下项目：
+
+```yaml
+admin_user:
+  name: deploy
+  password: "请替换为强密码"
+  nopasswd_sudo: false
+  ssh_public_keys:
+    - "ssh-ed25519 AAAA... 控制端公钥的完整一行"
+
+ssh:
+  port: 2233
+  permit_root_login: "no"
+  password_authentication: "no"
+  allowed_ips: []
+
+honeypot:
+  enabled: false
+
+login_notify:
+  enabled: false
+```
+
+获取可以粘贴到 `ssh_public_keys` 的完整公钥：
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+注意：
+
+- `admin_user.password` 必填，至少 8 位；即使禁用 SSH 密码登录，该密码仍可用于 sudo。
+- `ssh_public_keys` 必须填写完整的 `.pub` 公钥，绝不能填写或上传私钥。
+- 暂时没有 webhook 时，把 `login_notify.enabled` 设为 `false`；启用时必须填写真实 `webhook_url`。
+- 首次部署必须让 `honeypot.enabled` 和 `ssh.allowed_ips` 保持关闭/空数组，避免端口冲突或 IP 写错导致锁死。
+- `ssh.port` 是稍后要切换到的目标端口；`inventory.ini` 的 `ansible_port` 是当前已经生效的端口。
+
+### 5. 首次连接测试
+
+使用公钥时：
+
+```bash
+ansible -i inventory.ini vps -m ping
+```
+
+如果首次只能使用 root 密码登录，可暂时删掉主机行中的 `ansible_ssh_private_key_file`，然后执行：
+
+```bash
+ansible -i inventory.ini vps -m ping -k
+```
+
+连接测试不通过时不要运行加固。先用普通 SSH 排查用户、端口和密钥：
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 22 root@<VPS_IP>
+```
+
+### 6. 阶段一：执行基础加固
+
+使用 root 公钥登录：
+
 ```bash
 ./run.sh
-# 首次还在用 root 密码登录时：
-./run.sh -k --ask-become-pass
 ```
 
-### 4. 首次执行流程（重要）
-
-剧本采用**双 playbook 设计**，把"改 SSH 端口"这个唯一不可逆 + 容易锁死的操作隔离成独立入口：
-
-| Playbook | 命令 | 干什么 |
-|---|---|---|
-| `site.yml` | `./run.sh` | 执行基础安全加固；1Panel、WAF 等可选模块仅在配置中启用后部署。**SSH 端口跟随 inventory `ansible_port`**，不主动改。可反复幂等执行。 |
-| `change_port.yml` | `./run.sh --change-port --ask-become-pass` | 单独切 sshd 监听端口（关 ssh.socket → 改 Port → wait_for）。跑完手动改 inventory 后再跑 `./run.sh`。`-K` 是兜底，deploy 账号已 NOPASSWD sudo 时会被忽略。 |
-
-#### 时间线（推荐）
-
-```
-T0  config.yml: ssh.port=2233 honeypot.enabled=false
-    inventory: ansible_port=22 ansible_user=root
-T1  ./run.sh -k --ask-become-pass        ← 阶段 1：root 密码起手，跑完整机加固
-T2  剧本里：建 deploy / 写公钥 / 禁 root / 禁密码 / UFW 放行 22 / fail2ban；按配置部署可选模块
-T3  剧本结束。SSH 还在 22，但只能用 deploy + key 登
-T4  另一个终端验证：ssh -p 22 deploy@<VPS_IP>     ← 必须能进，否则别关 T1 的会话！
-T5  改 inventory：ansible_port=22 ansible_user=deploy（保持 22，只换用户）
-T6  ./run.sh                              ← 阶段 2：用 deploy 重跑一遍，确认 ok=changed=0
-T7  ./run.sh --change-port --ask-become-pass  ← 阶段 3：切端口（-K 兜底，免密时被忽略）
-T8  另一个终端验证：ssh -p 2233 deploy@<VPS_IP>
-T9  改 inventory：ansible_port=2233       UFW 已在 T7 即时放行新端口；22 永远不删（给蜜罐留的）
-T10 HFish 想用 22：把 honeypot.enabled 改 true，./run.sh -t ufw,hfish
-```
-
-#### 关键决策
-
-- **SSH 端口的"当前值"由 inventory 的 `ansible_port` 决定**（site.yml 里叫 `effective_ssh_port`）。改了 inventory，UFW / fail2ban / limit_ssh_ip 自动同步，不需要手改 config。
-- **首次部署 honeypot 必须关**（默认 `enabled: false`）：因为 SSH 还在 22，蜜罐也想占 22 会冲突，site.yml 的 pre_tasks assert 会直接拦下。
-- **`./run.sh --change-port` 是独立 playbook**：不会被 `./run.sh` 自动触发，必须显式执行。
-
-#### ⚠️ 安全护栏（防锁死）
-
-- **任何阶段执行前都保留当前 SSH 终端**，等新窗口验证连接成功后再关。
-- **SSH 白名单 `ssh.allowed_ips` 第一次先留空**（默认就是空数组），等 deploy 账号能稳定登录后再加。填错 IP 会被锁死，只能用 VPS 厂商控制台的 VNC / 救援模式恢复。
-- **change_port 前确认 deploy 公钥能用**：阶段 2 必须先跑通——只有 deploy 能用 key 登 22，才有资格切端口。
-- 如果启用了雷池或 1Panel，第一次跑后请从 `reports/summary-*.md` 保存随机生成的访问地址和初始凭据，并尽快修改密码。
-
-### 5. 单独执行某个 role（增量维护）
-
-剧本里每个 role 都打了 tag，可以只跑想要的部分。**最常见场景**：后续在 `config.yml` 里加了新的白名单 IP，只需：
+使用 root 密码登录：
 
 ```bash
-./run.sh -t allowed_ips        # 只跑 limit_ssh_ip
+./run.sh -k
 ```
 
-完整 tag 列表：
+这一阶段会创建管理员、写入公钥、配置 sudo、禁用 root/密码 SSH 登录，并部署 UFW、Fail2ban、自动更新等已启用模块。`site.yml` 不会修改 SSH 端口，SSH 仍监听 inventory 中的当前端口 `22`。
+
+执行成功后不要关闭现有终端，另开一个窗口验证新管理员：
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 22 deploy@<VPS_IP>
+```
+
+只有新管理员能够正常登录并执行 `sudo -v`，才继续下一步。如果失败，保留原终端并通过云厂商控制台修复。
+
+### 7. 阶段二：切换 inventory 到新管理员并复跑
+
+把 `inventory.ini` 中的登录用户从 root 改为 `config.yml` 的 `admin_user.name`，端口仍保持 22：
+
+```ini
+vps1 ansible_host=<VPS_IP> ansible_port=22 ansible_user=deploy ansible_ssh_private_key_file=~/.ssh/id_ed25519
+```
+
+如果 `nopasswd_sudo: true`：
+
+```bash
+./run.sh
+```
+
+如果 `nopasswd_sudo: false`：
+
+```bash
+./run.sh --ask-become-pass
+```
+
+第二次执行用于确认新管理员、sudo 和公钥均可被 Ansible 使用。幂等执行时大多数任务应显示 `ok`，只有状态确实变化的任务显示 `changed`。
+
+### 8. 阶段三：单独切换 SSH 端口
+
+确认阶段二完全成功后，再运行独立端口切换 playbook：
+
+```bash
+./run.sh --change-port
+```
+
+管理员需要 sudo 密码时：
+
+```bash
+./run.sh --change-port --ask-become-pass
+```
+
+假设 `config.yml` 中配置了 `ssh.port: 2233`，执行完成后保留原终端，并在新窗口验证：
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 2233 deploy@<VPS_IP>
+```
+
+验证成功后，把 inventory 改成新的当前端口：
+
+```ini
+vps1 ansible_host=<VPS_IP> ansible_port=2233 ansible_user=deploy ansible_ssh_private_key_file=~/.ssh/id_ed25519
+```
+
+然后再执行一次，让 UFW、Fail2ban 和报告同步到新端口：
+
+```bash
+./run.sh
+```
+
+### 9. 启用可选模块
+
+SSH 已离开 22 且 inventory 已更新后，才可以让 HFish 使用 22：
+
+```yaml
+honeypot:
+  enabled: true
+  port: 22
+```
+
+```bash
+./run.sh -t ufw,hfish
+```
+
+雷池、1Panel、Cloudflare UFW 和 SSL 模板也应先修改 `config.yml` 中相应模块的 `enabled`，再执行完整 playbook 或对应 tag。WireGuard 当前仍是占位模块，不会自动部署。
+
+```bash
+./run.sh -t waf          # 雷池 WAF
+./run.sh -t 1panel       # 1Panel
+./run.sh -t ssl          # 只生成 SSL 模板，不会自动申请证书
+./run.sh -t cf           # Cloudflare UFW
+```
+
+首次部署面板后立即查看最新报告，并修改初始密码：
+
+```bash
+ls -lt reports/
+```
+
+报告可能包含雷池、1Panel 或 HFish 的初始凭据，应按敏感文件保存，不要提交 Git 或发到公开位置。
+
+### 10. 后续增量维护
 
 | 目标 | 命令 |
 |---|---|
+| 完整幂等执行 | `./run.sh` |
 | 只更新 SSH 白名单 | `./run.sh -t allowed_ips` |
-| **加 / 删一个开放端口** | 编辑 `config.yml` 的 `ufw.allow_rules` 后 `./run.sh -t ufw`（增量同步：present 加，absent 删） |
-| 只改 SSH 加固配置（不改端口） | `./run.sh -t ssh` |
-| **切换 SSH 端口**（独立 playbook） | `./run.sh --change-port --ask-become-pass`，跑完手改 inventory 的 ansible_port |
-| 只装 / 重配 fail2ban | `./run.sh -t fail2ban` |
-| 只调整 UFW | `./run.sh -t ufw` |
-| 只装 / 检查 HFish 蜜罐 | `./run.sh -t hfish` |
-| 只刷新登录通知 | `./run.sh -t login_notify` |
-| 只装 1Panel | `./run.sh -t 1panel` |
-| 只装雷池 WAF | `./run.sh -t waf` |
-| 只生成 SSL 模板 | `./run.sh -t ssl` |
-| 只跑某台 VPS | `./run.sh -l vps2` |
-| 跑某台机器 + 只白名单 | `./run.sh -l vps2 -t allowed_ips` |
-| 跳过某个模块 | `./run.sh --skip-tags waf,1panel` |
+| 加/删 UFW 端口 | 编辑 `ufw.allow_rules` 后执行 `./run.sh -t ufw` |
+| 更新 SSH 加固配置（不改端口） | `./run.sh -t ssh` |
+| 切换 SSH 端口 | `./run.sh --change-port`，完成后更新 inventory |
+| 更新 Fail2ban | `./run.sh -t fail2ban` |
+| 更新 HFish | `./run.sh -t hfish` |
+| 更新登录通知 | `./run.sh -t login_notify` |
+| 更新 1Panel | `./run.sh -t 1panel` |
+| 更新雷池 WAF | `./run.sh -t waf` |
+| 只运行一台 VPS | `./run.sh -l vps2` |
+| 单台机器更新白名单 | `./run.sh -l vps2 -t allowed_ips` |
+| 跳过模块 | `./run.sh --skip-tags waf,1panel` |
 
-> `common` / `notify` / `report` 标了 `always`，跑任意 tag 时也会一起执行（保证基础包、通知脚本和报告都是最新的）。
+> `common`、`notify` 和 `report` 使用了 `always` 标签，执行单个 tag 时也可能运行基础准备和报告任务。
 
-执行完后，最终报告会落到 `./reports/summary-YYYYMMDD-HHMMSS.md`，按 3 台机器逐台列出：
-- 已执行的安全操作
-- SSH 新端口、管理员账号 / 初始密码
-- 雷池 WAF 控制台地址 + 安装脚本随机生成的初始账号密码（仅首次安装可从日志解析）
-- 1Panel 入口地址 + 账号 + 密码 + 端口（未在配置中指定的字段由官方安装脚本生成）
-- HFish 管理台地址与首次默认凭据（登录后必须立即修改）
-- SSH 白名单
-- 待手动处理的项（SSL / WireGuard）
+### 防锁死检查清单
+
+- 每次修改 SSH 用户、端口、密钥或白名单时，都保留一个已登录终端。
+- 必须在另一个窗口验证新连接成功后，才能关闭旧终端。
+- 首次部署不要配置 `ssh.allowed_ips`；新管理员和新端口验证成功后再逐步加入白名单。
+- 确保云厂商安全组同时允许当前 SSH 端口和准备切换的新端口。
+- 如果启用 HFish，确认真实 SSH 已经离开 22。
+- 面板管理端口不要无条件暴露公网，优先使用固定 IP 白名单或 VPN。
 
 ## 安全提示
 
