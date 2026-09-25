@@ -157,6 +157,14 @@ login_notify:
 cat ~/.ssh/id_ed25519.pub
 ```
 
+如果以后需要补充或更换控制电脑的公钥，修改 `admin_user.ssh_public_keys` 后运行：
+
+```bash
+./run.sh -t user
+```
+
+该命令会确保配置中的公钥存在于管理员的 `~/.ssh/authorized_keys`，不会删除已经存在的其他公钥。`lookup('file', '~/.ssh/id_ed25519.pub')` 始终读取运行 Ansible 的控制端文件；如果 Ansible 临时运行在 VPS 上，它读取的是 VPS 的公钥，而不是 Windows 电脑的公钥，因此跨设备时建议直接粘贴完整 `.pub` 内容。
+
 注意：
 
 - `admin_user.password` 必填，至少 8 位；即使禁用 SSH 密码登录，该密码仍可用于 sudo。
@@ -299,6 +307,7 @@ ls -lt reports/
 | 目标 | 命令 |
 |---|---|
 | 完整幂等执行 | `./run.sh` |
+| 创建/检查管理员并追加 SSH 公钥 | 编辑 `admin_user.ssh_public_keys` 后执行 `./run.sh -t user` |
 | 只更新 SSH 白名单 | `./run.sh -t allowed_ips` |
 | 加/删 UFW 端口 | 编辑 `ufw.allow_rules` 后执行 `./run.sh -t ufw` |
 | 更新 SSH 加固配置（不改端口） | `./run.sh -t ssh` |
